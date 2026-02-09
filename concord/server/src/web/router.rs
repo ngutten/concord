@@ -6,6 +6,7 @@ use tower_http::services::ServeDir;
 
 use crate::engine::chat_engine::ChatEngine;
 
+use super::rest_api;
 use super::ws_handler::ws_upgrade;
 
 /// Build the axum router with all HTTP and WebSocket routes.
@@ -17,6 +18,11 @@ pub fn build_router(engine: Arc<ChatEngine>) -> Router {
 
     Router::new()
         .route("/ws", axum::routing::get(ws_upgrade))
+        .route("/api/channels", axum::routing::get(rest_api::get_channels))
+        .route(
+            "/api/channels/{name}/messages",
+            axum::routing::get(rest_api::get_channel_history),
+        )
         .fallback_service(ServeDir::new("static"))
         .layer(cors)
         .with_state(engine)

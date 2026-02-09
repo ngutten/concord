@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tracing::{error, info, warn};
 
@@ -36,6 +37,11 @@ enum ClientMessage {
         channel: String,
         topic: String,
     },
+    FetchHistory {
+        channel: String,
+        before: Option<String>,
+        limit: Option<i64>,
+    },
     ListChannels,
     GetMembers {
         channel: String,
@@ -57,14 +63,11 @@ async fn handle_ws_connection(socket: WebSocket, engine: Arc<ChatEngine>, nickna
         Ok(pair) => pair,
         Err(e) => {
             warn!(%nickname, error = %e, "WebSocket connection rejected");
-            // Can't send error before upgrade completes cleanly, just drop
             return;
         }
     };
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
-
-    use futures_util::{SinkExt, StreamExt};
 
     // Spawn write loop: engine events -> WebSocket frames
     let write_handle = tokio::spawn(async move {
@@ -95,7 +98,7 @@ async fn handle_ws_connection(socket: WebSocket, engine: Arc<ChatEngine>, nickna
 
         match msg {
             Message::Text(text) => {
-                handle_client_message(&engine_ref, session_id, &text);
+                handle_client_message(&engine_ref, session_id, &text).await;
             }
             Message::Close(_) => break,
             _ => {} // Ignore binary, ping, pong (axum handles ping/pong)
@@ -108,7 +111,7 @@ async fn handle_ws_connection(socket: WebSocket, engine: Arc<ChatEngine>, nickna
     info!(%session_id, %nickname, "WebSocket connection closed");
 }
 
-fn handle_client_message(
+async fn handle_client_message(
     engine: &ChatEngine,
     session_id: crate::engine::events::SessionId,
     text: &str,
@@ -132,6 +135,29 @@ fn handle_client_message(
         ClientMessage::SetTopic { channel, topic } => {
             engine.set_topic(session_id, &channel, topic)
         }
+        ClientMessage::FetchHistory {
+            channel,
+            before,
+            limit,
+        } => {
+            let limit = limit.unwrap_or(50).min(200);
+            match engine
+                .fetch_history(&channel, before.as_deref(), limit)
+                .await
+            {
+                Ok((messages, has_more)) => {
+                    if let Some(session) = engine.get_session(session_id) {
+                        let _ = session.send(ChatEvent::History {
+                            channel,
+                            messages,
+                            has_more,
+                        });
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
         ClientMessage::ListChannels => {
             let channels = engine.list_channels();
             if let Some(session) = engine.get_session(session_id) {
@@ -142,10 +168,7 @@ fn handle_client_message(
         ClientMessage::GetMembers { channel } => match engine.get_members(&channel) {
             Ok(members) => {
                 if let Some(session) = engine.get_session(session_id) {
-                    let _ = session.send(ChatEvent::Names {
-                        channel,
-                        members,
-                    });
+                    let _ = session.send(ChatEvent::Names { channel, members });
                 }
                 Ok(())
             }

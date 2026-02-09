@@ -2,12 +2,13 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use dashmap::DashMap;
+use sqlx::SqlitePool;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use super::channel::ChannelState;
-use super::events::{ChannelInfo, ChatEvent, SessionId};
+use super::events::{ChannelInfo, ChatEvent, HistoryMessage, SessionId};
 use super::user_session::{Protocol, UserSession};
 
 /// The central hub that manages all chat state. Protocol-agnostic —
@@ -19,15 +20,43 @@ pub struct ChatEngine {
     channels: DashMap<String, ChannelState>,
     /// Reverse lookup: nickname -> session ID (for DMs and WHOIS).
     nick_to_session: DashMap<String, SessionId>,
+    /// Optional database pool. When present, messages and channels are persisted.
+    db: Option<SqlitePool>,
 }
 
 impl ChatEngine {
-    pub fn new() -> Self {
+    pub fn new(db: Option<SqlitePool>) -> Self {
         Self {
             sessions: DashMap::new(),
             channels: DashMap::new(),
             nick_to_session: DashMap::new(),
+            db,
         }
+    }
+
+    /// Load default channels from the database into memory on startup.
+    pub async fn load_channels_from_db(&self) -> Result<(), String> {
+        let Some(pool) = &self.db else {
+            return Ok(());
+        };
+
+        let rows = crate::db::queries::channels::list_channels(pool)
+            .await
+            .map_err(|e| format!("Failed to load channels: {}", e))?;
+
+        for row in rows {
+            self.channels
+                .entry(row.name.clone())
+                .or_insert_with(|| {
+                    let mut ch = ChannelState::new(row.name.clone());
+                    ch.topic = row.topic;
+                    ch.topic_set_by = row.topic_set_by;
+                    ch
+                });
+        }
+
+        info!(count = self.channels.len(), "loaded channels from database");
+        Ok(())
     }
 
     /// Register a new session. Returns the session ID and an event receiver
@@ -69,8 +98,14 @@ impl ChatEngine {
         let nickname = session.nickname.clone();
         self.nick_to_session.remove(&nickname);
 
-        // Remove from all channels and notify remaining members
-        let channels_to_leave: Vec<String> = session.channels.iter().cloned().collect();
+        // Collect channels this session was in
+        let channels_to_leave: Vec<String> = self
+            .channels
+            .iter()
+            .filter(|ch| ch.members.contains(&session_id))
+            .map(|ch| ch.name.clone())
+            .collect();
+
         for channel_name in &channels_to_leave {
             if let Some(mut channel) = self.channels.get_mut(channel_name) {
                 channel.members.remove(&session_id);
@@ -94,7 +129,6 @@ impl ChatEngine {
     pub fn join_channel(&self, session_id: SessionId, channel_name: &str) -> Result<(), String> {
         let channel_name = normalize_channel_name(channel_name);
 
-        // Get session (need to update its channel set)
         let session = self
             .sessions
             .get(&session_id)
@@ -111,9 +145,17 @@ impl ChatEngine {
             channel.members.insert(session_id);
         }
 
-        // We can't mutate through Arc, so we track channel membership in the
-        // ChannelState. The session.channels field is set at creation and we
-        // won't mutate it here — the channel's member set is the source of truth.
+        // Persist channel to database
+        if let Some(pool) = &self.db {
+            let pool = pool.clone();
+            let ch_name = channel_name.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::db::queries::channels::ensure_channel(&pool, &ch_name).await
+                {
+                    error!(error = %e, "failed to persist channel");
+                }
+            });
+        }
 
         // Broadcast join event to the channel (including the joiner)
         let join_event = ChatEvent::Join {
@@ -182,7 +224,7 @@ impl ChatEngine {
         let _ = session.send(part_event.clone());
         self.broadcast_to_channel(&channel_name, &part_event, Some(session_id));
 
-        // Remove empty channels
+        // Remove empty channels (but not from DB — channels persist)
         self.channels
             .remove_if(&channel_name, |_, ch| ch.members.is_empty());
 
@@ -203,8 +245,9 @@ impl ChatEngine {
             .ok_or("Session not found")?
             .clone();
 
+        let msg_id = Uuid::new_v4();
         let event = ChatEvent::Message {
-            id: Uuid::new_v4(),
+            id: msg_id,
             from: session.nickname.clone(),
             target: target.to_string(),
             content: content.to_string(),
@@ -223,6 +266,26 @@ impl ChatEngine {
                 return Err(format!("You are not in channel {}", channel_name));
             }
 
+            drop(channel);
+
+            // Persist to database
+            if let Some(pool) = &self.db {
+                let pool = pool.clone();
+                let id = msg_id.to_string();
+                let ch = channel_name.clone();
+                let sid = session_id.to_string();
+                let nick = session.nickname.clone();
+                let msg = content.to_string();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        crate::db::queries::messages::insert_message(&pool, &id, &ch, &sid, &nick, &msg)
+                            .await
+                    {
+                        error!(error = %e, "failed to persist message");
+                    }
+                });
+            }
+
             // Broadcast to all members except the sender
             self.broadcast_to_channel(&channel_name, &event, Some(session_id));
         } else {
@@ -231,6 +294,24 @@ impl ChatEngine {
                 .nick_to_session
                 .get(target)
                 .ok_or(format!("No such user: {}", target))?;
+
+            // Persist DM to database
+            if let Some(pool) = &self.db {
+                let pool = pool.clone();
+                let id = msg_id.to_string();
+                let sid = session_id.to_string();
+                let nick = session.nickname.clone();
+                let target_sid = target_session_id.value().to_string();
+                let msg = content.to_string();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        crate::db::queries::messages::insert_dm(&pool, &id, &sid, &nick, &target_sid, &msg)
+                            .await
+                    {
+                        error!(error = %e, "failed to persist DM");
+                    }
+                });
+            }
 
             if let Some(target_session) = self.sessions.get(target_session_id.value()) {
                 let _ = target_session.send(event);
@@ -270,6 +351,21 @@ impl ChatEngine {
 
         drop(channel);
 
+        // Persist topic to database
+        if let Some(pool) = &self.db {
+            let pool = pool.clone();
+            let ch = channel_name.clone();
+            let t = topic.clone();
+            let by = session.nickname.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    crate::db::queries::channels::set_topic(&pool, &ch, &t, &by).await
+                {
+                    error!(error = %e, "failed to persist topic");
+                }
+            });
+        }
+
         let event = ChatEvent::TopicChange {
             channel: channel_name.clone(),
             set_by: session.nickname.clone(),
@@ -278,6 +374,42 @@ impl ChatEngine {
         self.broadcast_to_channel(&channel_name, &event, None);
 
         Ok(())
+    }
+
+    /// Fetch message history for a channel from the database.
+    pub async fn fetch_history(
+        &self,
+        channel_name: &str,
+        before: Option<&str>,
+        limit: i64,
+    ) -> Result<(Vec<HistoryMessage>, bool), String> {
+        let Some(pool) = &self.db else {
+            return Ok((vec![], false));
+        };
+
+        let channel_name = normalize_channel_name(channel_name);
+        // Fetch one extra to determine if there are more
+        let rows =
+            crate::db::queries::messages::fetch_channel_history(pool, &channel_name, before, limit + 1)
+                .await
+                .map_err(|e| format!("Failed to fetch history: {}", e))?;
+
+        let has_more = rows.len() as i64 > limit;
+        let messages: Vec<HistoryMessage> = rows
+            .into_iter()
+            .take(limit as usize)
+            .map(|row| HistoryMessage {
+                id: row.id.parse().unwrap_or_default(),
+                from: row.sender_nick,
+                content: row.content,
+                timestamp: row
+                    .created_at
+                    .parse()
+                    .unwrap_or_else(|_| Utc::now()),
+            })
+            .collect();
+
+        Ok((messages, has_more))
     }
 
     /// List all channels.
@@ -364,7 +496,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_and_disconnect() {
-        let engine = ChatEngine::new();
+        let engine = ChatEngine::new(None);
 
         let (session_id, _rx) = engine.connect("alice".into(), Protocol::WebSocket).unwrap();
         assert!(!engine.is_nick_available("alice"));
@@ -375,7 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_duplicate_nick_rejected() {
-        let engine = ChatEngine::new();
+        let engine = ChatEngine::new(None);
 
         let (_sid, _rx) = engine.connect("alice".into(), Protocol::WebSocket).unwrap();
         let result = engine.connect("alice".into(), Protocol::WebSocket);
@@ -384,7 +516,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_join_and_message() {
-        let engine = ChatEngine::new();
+        let engine = ChatEngine::new(None);
 
         let (sid1, mut rx1) = engine.connect("alice".into(), Protocol::WebSocket).unwrap();
         let (sid2, mut rx2) = engine.connect("bob".into(), Protocol::WebSocket).unwrap();
@@ -417,7 +549,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_part_channel() {
-        let engine = ChatEngine::new();
+        let engine = ChatEngine::new(None);
 
         let (sid1, mut rx1) = engine.connect("alice".into(), Protocol::WebSocket).unwrap();
         let (sid2, _rx2) = engine.connect("bob".into(), Protocol::WebSocket).unwrap();
@@ -439,7 +571,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_topic() {
-        let engine = ChatEngine::new();
+        let engine = ChatEngine::new(None);
 
         let (sid, mut rx) = engine.connect("alice".into(), Protocol::WebSocket).unwrap();
         engine.join_channel(sid, "#general").unwrap();
@@ -460,7 +592,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dm() {
-        let engine = ChatEngine::new();
+        let engine = ChatEngine::new(None);
 
         let (sid1, _rx1) = engine.connect("alice".into(), Protocol::WebSocket).unwrap();
         let (_sid2, mut rx2) = engine.connect("bob".into(), Protocol::WebSocket).unwrap();
@@ -485,7 +617,7 @@ mod tests {
 
     #[test]
     fn test_list_channels() {
-        let engine = ChatEngine::new();
+        let engine = ChatEngine::new(None);
 
         let (sid, _rx) = engine.connect("alice".into(), Protocol::WebSocket).unwrap();
         engine.join_channel(sid, "#general").unwrap();
