@@ -1,4 +1,4 @@
-import type { AuthStatus, ChannelInfo, CreateTokenResponse, HistoryResponse, IrcToken, UserProfile } from './types';
+import type { AuthStatus, ChannelInfo, CreateTokenResponse, HistoryResponse, IrcToken, PublicUserProfile, UserProfile } from './types';
 
 const BASE = '/api';
 
@@ -34,6 +34,10 @@ export const getChannelHistory = (name: string, before?: string, limit = 50) => 
   if (before) params.set('before', before);
   return request<HistoryResponse>(`/channels/${encodeURIComponent(ch)}/messages?${params}`);
 };
+
+// User profiles
+export const getUserProfile = (nickname: string) =>
+  request<PublicUserProfile>(`/users/${encodeURIComponent(nickname)}`);
 
 // IRC Tokens
 export const getTokens = () => request<IrcToken[]>('/tokens');

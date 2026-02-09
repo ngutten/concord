@@ -18,11 +18,23 @@ export interface ChannelInfo {
   member_count: number;
 }
 
+export interface MemberInfo {
+  nickname: string;
+  avatar_url?: string | null;
+}
+
 export interface HistoryMessage {
   id: string;
   from: string;
   content: string;
   timestamp: string;
+}
+
+export interface PublicUserProfile {
+  username: string;
+  avatar_url: string | null;
+  provider: string | null;
+  provider_id: string | null;
 }
 
 export interface HistoryResponse {
@@ -48,13 +60,13 @@ export interface CreateTokenResponse {
 
 // Server → Client events
 export type ServerEvent =
-  | { type: 'message'; id: string; from: string; target: string; content: string; timestamp: string }
-  | { type: 'join'; nickname: string; channel: string }
+  | { type: 'message'; id: string; from: string; target: string; content: string; timestamp: string; avatar_url?: string }
+  | { type: 'join'; nickname: string; channel: string; avatar_url?: string }
   | { type: 'part'; nickname: string; channel: string; reason?: string }
   | { type: 'quit'; nickname: string; reason?: string }
   | { type: 'topic_change'; channel: string; set_by: string; topic: string }
   | { type: 'nick_change'; old_nick: string; new_nick: string }
-  | { type: 'names'; channel: string; members: string[] }
+  | { type: 'names'; channel: string; members: MemberInfo[] }
   | { type: 'topic'; channel: string; topic: string }
   | { type: 'channel_list'; channels: ChannelInfo[] }
   | { type: 'history'; channel: string; messages: HistoryMessage[]; has_more: boolean }

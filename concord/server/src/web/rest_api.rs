@@ -117,6 +117,39 @@ pub async fn get_me(
     }
 }
 
+// ── User profile lookup (public) ──────────────────────────
+
+#[derive(Serialize)]
+pub struct PublicUserProfile {
+    pub username: String,
+    pub avatar_url: Option<String>,
+    pub provider: Option<String>,
+    pub provider_id: Option<String>,
+}
+
+/// GET /api/users/:nickname — look up a user's public profile by nickname.
+pub async fn get_user_profile(
+    State(state): State<Arc<AppState>>,
+    Path(nickname): Path<String>,
+) -> impl IntoResponse {
+    match users::get_user_by_nickname(&state.db, &nickname).await {
+        Ok(Some((_id, username, _email, avatar_url, provider, provider_id))) => {
+            Json(PublicUserProfile {
+                username,
+                avatar_url,
+                provider,
+                provider_id,
+            })
+            .into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "User not found").into_response(),
+        Err(e) => {
+            error!(error = %e, "Failed to fetch user profile");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
+        }
+    }
+}
+
 // ── IRC token management (authenticated) ─────────────────
 
 #[derive(Deserialize)]

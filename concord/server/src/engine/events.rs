@@ -20,10 +20,17 @@ pub enum ChatEvent {
         target: String,
         content: String,
         timestamp: DateTime<Utc>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        avatar_url: Option<String>,
     },
 
     /// User joined a channel.
-    Join { nickname: String, channel: String },
+    Join {
+        nickname: String,
+        channel: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        avatar_url: Option<String>,
+    },
 
     /// User left a channel.
     Part {
@@ -57,7 +64,7 @@ pub enum ChatEvent {
     /// Channel member list (sent on join).
     Names {
         channel: String,
-        members: Vec<String>,
+        members: Vec<MemberInfo>,
     },
 
     /// Current topic of a channel (sent on join).
@@ -87,6 +94,13 @@ pub struct ChannelInfo {
     pub name: String,
     pub topic: String,
     pub member_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemberInfo {
+    pub nickname: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

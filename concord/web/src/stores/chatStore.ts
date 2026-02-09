@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { ChannelInfo, HistoryMessage, ServerEvent } from '../api/types';
+import type { ChannelInfo, HistoryMessage, MemberInfo, ServerEvent } from '../api/types';
 import { WebSocketManager } from '../api/websocket';
 
 interface ChatState {
@@ -7,8 +7,10 @@ interface ChatState {
   nickname: string | null;
   channels: ChannelInfo[];
   messages: Record<string, HistoryMessage[]>;
-  members: Record<string, string[]>;
+  members: Record<string, MemberInfo[]>;
   hasMore: Record<string, boolean>;
+  /** nickname -> avatar_url cache (populated from Names/Join/Message events) */
+  avatars: Record<string, string>;
   ws: WebSocketManager | null;
 
   connect: (nickname: string) => void;
@@ -23,6 +25,14 @@ interface ChatState {
   getMembers: (channel: string) => void;
 }
 
+/** Cache an avatar_url for a nickname if present. */
+function cacheAvatar(avatars: Record<string, string>, nickname: string, avatar_url?: string | null): Record<string, string> {
+  if (avatar_url && avatars[nickname] !== avatar_url) {
+    return { ...avatars, [nickname]: avatar_url };
+  }
+  return avatars;
+}
+
 export const useChatStore = create<ChatState>((set, get) => ({
   connected: false,
   nickname: null,
@@ -30,26 +40,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
   messages: {},
   members: {},
   hasMore: {},
+  avatars: {},
   ws: null,
 
   connect: (nickname: string) => {
     if (get().ws) {
-      console.log('[chatStore] connect called but ws already exists, skipping');
       return;
     }
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${protocol}//${window.location.host}/ws?nickname=${encodeURIComponent(nickname)}`;
-    console.log('[chatStore] connecting WebSocket to:', url);
 
     const ws = new WebSocketManager(
       url,
       (event) => {
-        console.log('[chatStore] ws event:', event.type, event);
         get().handleEvent(event);
       },
       (connected) => {
-        console.log('[chatStore] ws status changed:', connected);
         set({ connected });
         if (connected) {
           ws.send({ type: 'list_channels' });
@@ -62,7 +69,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   disconnect: () => {
-    console.log('[chatStore] disconnect called');
     get().ws?.disconnect();
     set({ ws: null, connected: false });
   },
@@ -81,19 +87,22 @@ export const useChatStore = create<ChatState>((set, get) => ({
             ...s.messages,
             [event.target]: [...(s.messages[event.target] || []), msg],
           },
+          avatars: cacheAvatar(s.avatars, event.from, event.avatar_url),
         }));
         break;
       }
 
       case 'join': {
+        const memberInfo: MemberInfo = { nickname: event.nickname, avatar_url: event.avatar_url };
         set((s) => {
           const current = s.members[event.channel] || [];
-          if (current.includes(event.nickname)) return s;
+          if (current.some((m) => m.nickname === event.nickname)) return s;
           return {
             members: {
               ...s.members,
-              [event.channel]: [...current, event.nickname],
+              [event.channel]: [...current, memberInfo],
             },
+            avatars: cacheAvatar(s.avatars, event.nickname, event.avatar_url),
           };
         });
         break;
@@ -104,7 +113,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           members: {
             ...s.members,
             [event.channel]: (s.members[event.channel] || []).filter(
-              (n) => n !== event.nickname,
+              (m) => m.nickname !== event.nickname,
             ),
           },
         }));
@@ -115,7 +124,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         set((s) => {
           const newMembers = { ...s.members };
           for (const ch in newMembers) {
-            newMembers[ch] = newMembers[ch].filter((n) => n !== event.nickname);
+            newMembers[ch] = newMembers[ch].filter((m) => m.nickname !== event.nickname);
           }
           return { members: newMembers };
         });
@@ -123,9 +132,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }
 
       case 'names': {
-        set((s) => ({
-          members: { ...s.members, [event.channel]: event.members },
-        }));
+        set((s) => {
+          let newAvatars = { ...s.avatars };
+          for (const m of event.members) {
+            if (m.avatar_url) {
+              newAvatars[m.nickname] = m.avatar_url;
+            }
+          }
+          return {
+            members: { ...s.members, [event.channel]: event.members },
+            avatars: newAvatars,
+          };
+        });
         break;
       }
 

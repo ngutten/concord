@@ -8,7 +8,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use super::channel::ChannelState;
-use super::events::{ChannelInfo, ChatEvent, HistoryMessage, SessionId};
+use super::events::{ChannelInfo, ChatEvent, HistoryMessage, MemberInfo, SessionId};
 use super::rate_limiter::RateLimiter;
 use super::user_session::{Protocol, UserSession};
 use super::validation;
@@ -70,6 +70,7 @@ impl ChatEngine {
         &self,
         nickname: String,
         protocol: Protocol,
+        avatar_url: Option<String>,
     ) -> Result<(SessionId, mpsc::UnboundedReceiver<ChatEvent>), String> {
         validation::validate_nickname(&nickname)?;
 
@@ -88,6 +89,7 @@ impl ChatEngine {
             nickname.clone(),
             protocol,
             tx,
+            avatar_url,
         ));
 
         self.sessions.insert(session_id, session);
@@ -171,6 +173,7 @@ impl ChatEngine {
         let join_event = ChatEvent::Join {
             nickname: session.nickname.clone(),
             channel: channel_name.clone(),
+            avatar_url: session.avatar_url.clone(),
         };
         self.broadcast_to_channel(&channel_name, &join_event, None);
 
@@ -184,10 +187,15 @@ impl ChatEngine {
             }
 
             // Send member list to the joiner
-            let members: Vec<String> = channel
+            let members: Vec<MemberInfo> = channel
                 .members
                 .iter()
-                .filter_map(|sid| self.sessions.get(sid).map(|s| s.nickname.clone()))
+                .filter_map(|sid| {
+                    self.sessions.get(sid).map(|s| MemberInfo {
+                        nickname: s.nickname.clone(),
+                        avatar_url: s.avatar_url.clone(),
+                    })
+                })
                 .collect();
 
             let _ = session.send(ChatEvent::Names {
@@ -268,6 +276,7 @@ impl ChatEngine {
             target: target.to_string(),
             content: content.to_string(),
             timestamp: Utc::now(),
+            avatar_url: session.avatar_url.clone(),
         };
 
         if target.starts_with('#') {
@@ -442,7 +451,7 @@ impl ChatEngine {
     }
 
     /// Get members of a channel.
-    pub fn get_members(&self, channel_name: &str) -> Result<Vec<String>, String> {
+    pub fn get_members(&self, channel_name: &str) -> Result<Vec<MemberInfo>, String> {
         let channel_name = normalize_channel_name(channel_name);
         let channel = self
             .channels
@@ -452,7 +461,12 @@ impl ChatEngine {
         Ok(channel
             .members
             .iter()
-            .filter_map(|sid| self.sessions.get(sid).map(|s| s.nickname.clone()))
+            .filter_map(|sid| {
+                self.sessions.get(sid).map(|s| MemberInfo {
+                    nickname: s.nickname.clone(),
+                    avatar_url: s.avatar_url.clone(),
+                })
+            })
             .collect())
     }
 
@@ -515,7 +529,7 @@ mod tests {
     async fn test_connect_and_disconnect() {
         let engine = ChatEngine::new(None);
 
-        let (session_id, _rx) = engine.connect("alice".into(), Protocol::WebSocket).unwrap();
+        let (session_id, _rx) = engine.connect("alice".into(), Protocol::WebSocket, None).unwrap();
         assert!(!engine.is_nick_available("alice"));
 
         engine.disconnect(session_id);
@@ -526,8 +540,8 @@ mod tests {
     async fn test_duplicate_nick_replaces_old_session() {
         let engine = ChatEngine::new(None);
 
-        let (sid1, _rx1) = engine.connect("alice".into(), Protocol::WebSocket).unwrap();
-        let (sid2, _rx2) = engine.connect("alice".into(), Protocol::WebSocket).unwrap();
+        let (sid1, _rx1) = engine.connect("alice".into(), Protocol::WebSocket, None).unwrap();
+        let (sid2, _rx2) = engine.connect("alice".into(), Protocol::WebSocket, None).unwrap();
 
         // Old session should be gone, new one active
         assert!(engine.get_session(sid1).is_none());
@@ -538,8 +552,8 @@ mod tests {
     async fn test_join_and_message() {
         let engine = ChatEngine::new(None);
 
-        let (sid1, mut rx1) = engine.connect("alice".into(), Protocol::WebSocket).unwrap();
-        let (sid2, mut rx2) = engine.connect("bob".into(), Protocol::WebSocket).unwrap();
+        let (sid1, mut rx1) = engine.connect("alice".into(), Protocol::WebSocket, None).unwrap();
+        let (sid2, mut rx2) = engine.connect("bob".into(), Protocol::WebSocket, None).unwrap();
 
         engine.join_channel(sid1, "#general").unwrap();
         engine.join_channel(sid2, "#general").unwrap();
@@ -571,8 +585,8 @@ mod tests {
     async fn test_part_channel() {
         let engine = ChatEngine::new(None);
 
-        let (sid1, mut rx1) = engine.connect("alice".into(), Protocol::WebSocket).unwrap();
-        let (sid2, _rx2) = engine.connect("bob".into(), Protocol::WebSocket).unwrap();
+        let (sid1, mut rx1) = engine.connect("alice".into(), Protocol::WebSocket, None).unwrap();
+        let (sid2, _rx2) = engine.connect("bob".into(), Protocol::WebSocket, None).unwrap();
 
         engine.join_channel(sid1, "#general").unwrap();
         engine.join_channel(sid2, "#general").unwrap();
@@ -593,7 +607,7 @@ mod tests {
     async fn test_set_topic() {
         let engine = ChatEngine::new(None);
 
-        let (sid, mut rx) = engine.connect("alice".into(), Protocol::WebSocket).unwrap();
+        let (sid, mut rx) = engine.connect("alice".into(), Protocol::WebSocket, None).unwrap();
         engine.join_channel(sid, "#general").unwrap();
         while rx.try_recv().is_ok() {}
 
@@ -614,8 +628,8 @@ mod tests {
     async fn test_dm() {
         let engine = ChatEngine::new(None);
 
-        let (sid1, _rx1) = engine.connect("alice".into(), Protocol::WebSocket).unwrap();
-        let (_sid2, mut rx2) = engine.connect("bob".into(), Protocol::WebSocket).unwrap();
+        let (sid1, _rx1) = engine.connect("alice".into(), Protocol::WebSocket, None).unwrap();
+        let (_sid2, mut rx2) = engine.connect("bob".into(), Protocol::WebSocket, None).unwrap();
 
         engine.send_message(sid1, "bob", "Hey Bob!").unwrap();
 
@@ -639,7 +653,7 @@ mod tests {
     fn test_list_channels() {
         let engine = ChatEngine::new(None);
 
-        let (sid, _rx) = engine.connect("alice".into(), Protocol::WebSocket).unwrap();
+        let (sid, _rx) = engine.connect("alice".into(), Protocol::WebSocket, None).unwrap();
         engine.join_channel(sid, "#general").unwrap();
         engine.join_channel(sid, "#rust").unwrap();
 

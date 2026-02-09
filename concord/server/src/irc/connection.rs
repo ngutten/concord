@@ -217,7 +217,7 @@ pub async fn handle_irc_connection(stream: TcpStream, engine: Arc<ChatEngine>, d
                     }
 
                     // Try to register with the engine
-                    match engine.connect(nick_val.clone(), Protocol::Irc) {
+                    match engine.connect(nick_val.clone(), Protocol::Irc, None) {
                         Ok((sid, rx)) => {
                             let nick_owned = nick_val.clone();
 
@@ -296,7 +296,7 @@ fn event_to_irc_lines(my_nick: &str, event: &ChatEvent) -> Vec<String> {
         } => {
             vec![formatter::privmsg(from, target, content)]
         }
-        ChatEvent::Join { nickname, channel } => {
+        ChatEvent::Join { nickname, channel, .. } => {
             vec![formatter::join(nickname, channel)]
         }
         ChatEvent::Part {
@@ -324,8 +324,9 @@ fn event_to_irc_lines(my_nick: &str, event: &ChatEvent) -> Vec<String> {
             vec![formatter::nick_change(old_nick, new_nick)]
         }
         ChatEvent::Names { channel, members } => {
+            let nicks: Vec<String> = members.iter().map(|m| m.nickname.clone()).collect();
             vec![
-                formatter::rpl_namreply(my_nick, channel, members),
+                formatter::rpl_namreply(my_nick, channel, &nicks),
                 formatter::rpl_endofnames(my_nick, channel),
             ]
         }

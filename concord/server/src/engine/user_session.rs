@@ -24,6 +24,8 @@ pub struct UserSession {
     /// Channels this session is currently in.
     pub channels: HashSet<String>,
     pub connected_at: DateTime<Utc>,
+    /// Avatar URL (from Bluesky profile or other source).
+    pub avatar_url: Option<String>,
 }
 
 impl UserSession {
@@ -32,6 +34,7 @@ impl UserSession {
         nickname: String,
         protocol: Protocol,
         outbound: mpsc::UnboundedSender<ChatEvent>,
+        avatar_url: Option<String>,
     ) -> Self {
         Self {
             id,
@@ -40,6 +43,7 @@ impl UserSession {
             outbound,
             channels: HashSet::new(),
             connected_at: Utc::now(),
+            avatar_url,
         }
     }
 

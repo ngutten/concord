@@ -93,13 +93,29 @@ pub async fn ws_upgrade(
             .into_response();
     };
 
+    // Look up avatar_url from DB if authenticated via cookie
+    let avatar_url = if jar.get("concord_session").is_some() {
+        if let Ok(claims) =
+            validate_session_token(jar.get("concord_session").unwrap().value(), &state.auth_config.jwt_secret)
+        {
+            match users::get_user(&state.db, &claims.sub).await {
+                Ok(Some((_id, _username, _email, avatar))) => avatar,
+                _ => None,
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let engine = state.engine.clone();
-    ws.on_upgrade(move |socket| handle_ws_connection(socket, engine, nickname))
+    ws.on_upgrade(move |socket| handle_ws_connection(socket, engine, nickname, avatar_url))
         .into_response()
 }
 
-async fn handle_ws_connection(socket: WebSocket, engine: Arc<ChatEngine>, nickname: String) {
-    let (session_id, mut event_rx) = match engine.connect(nickname.clone(), Protocol::WebSocket) {
+async fn handle_ws_connection(socket: WebSocket, engine: Arc<ChatEngine>, nickname: String, avatar_url: Option<String>) {
+    let (session_id, mut event_rx) = match engine.connect(nickname.clone(), Protocol::WebSocket, avatar_url) {
         Ok(pair) => pair,
         Err(e) => {
             warn!(%nickname, error = %e, "WebSocket connection rejected");
@@ -203,9 +219,9 @@ async fn handle_client_message(
             Ok(())
         }
         ClientMessage::GetMembers { channel } => match engine.get_members(&channel) {
-            Ok(members) => {
+            Ok(member_infos) => {
                 if let Some(session) = engine.get_session(session_id) {
-                    let _ = session.send(ChatEvent::Names { channel, members });
+                    let _ = session.send(ChatEvent::Names { channel, members: member_infos });
                 }
                 Ok(())
             }

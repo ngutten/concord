@@ -138,6 +138,28 @@ pub async fn get_all_irc_token_hashes(
     Ok(rows)
 }
 
+/// Look up a user profile by nickname, including OAuth provider info.
+/// Returns (user_id, username, email, avatar_url, provider, provider_id).
+pub async fn get_user_by_nickname(
+    pool: &SqlitePool,
+    nickname: &str,
+) -> Result<Option<(String, String, Option<String>, Option<String>, Option<String>, Option<String>)>, sqlx::Error>
+{
+    let row = sqlx::query_as::<_, (String, String, Option<String>, Option<String>, Option<String>, Option<String>)>(
+        "SELECT u.id, u.username, u.email, u.avatar_url, oa.provider, oa.provider_id \
+         FROM users u \
+         LEFT JOIN user_nicknames un ON u.id = un.user_id \
+         LEFT JOIN oauth_accounts oa ON u.id = oa.user_id \
+         WHERE u.username = ? OR un.nickname = ? \
+         LIMIT 1",
+    )
+    .bind(nickname)
+    .bind(nickname)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 /// Update last_used timestamp for an IRC token.
 pub async fn touch_irc_token(
     pool: &SqlitePool,

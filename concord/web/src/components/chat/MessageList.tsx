@@ -1,7 +1,8 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { useChatStore } from '../../stores/chatStore';
 import { useUiStore } from '../../stores/uiStore';
+import { UserProfilePopup } from '../members/UserProfilePopup';
 import type { HistoryMessage } from '../../api/types';
 
 const EMPTY_MESSAGES: HistoryMessage[] = [];
@@ -68,21 +69,53 @@ export function MessageList() {
 }
 
 function MessageItem({ message }: { message: HistoryMessage }) {
+  const avatars = useChatStore((s) => s.avatars);
+  const avatarUrl = avatars[message.from];
   const time = new Date(message.timestamp);
   const timeStr = time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const [showPopup, setShowPopup] = useState(false);
+  const [popupPos, setPopupPos] = useState<{ top: number; left: number } | null>(null);
+
+  const handleNameClick = (e: React.MouseEvent) => {
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    setPopupPos({ top: rect.bottom + 4, left: rect.left });
+    setShowPopup(true);
+  };
 
   return (
     <div className="group flex gap-4 px-4 py-1 hover:bg-bg-hover">
-      <div className="mt-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-bg-accent text-sm font-bold text-white">
-        {message.from[0]?.toUpperCase() || '?'}
-      </div>
+      <button onClick={handleNameClick} className="mt-1 shrink-0">
+        {avatarUrl ? (
+          <img
+            src={avatarUrl}
+            alt={message.from}
+            className="h-10 w-10 rounded-full object-cover"
+          />
+        ) : (
+          <div className="flex h-10 w-10 items-center justify-center rounded-full bg-bg-accent text-sm font-bold text-white">
+            {message.from[0]?.toUpperCase() || '?'}
+          </div>
+        )}
+      </button>
       <div className="min-w-0 flex-1">
         <div className="flex items-baseline gap-2">
-          <span className="font-medium text-text-primary">{message.from}</span>
+          <button
+            onClick={handleNameClick}
+            className="font-medium text-text-primary hover:underline"
+          >
+            {message.from}
+          </button>
           <span className="text-xs text-text-muted">{timeStr}</span>
         </div>
         <p className="whitespace-pre-wrap break-words text-text-secondary">{message.content}</p>
       </div>
+      {showPopup && popupPos && (
+        <UserProfilePopup
+          nickname={message.from}
+          position={popupPos}
+          onClose={() => setShowPopup(false)}
+        />
+      )}
     </div>
   );
 }

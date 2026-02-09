@@ -59,6 +59,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             axum::routing::get(atproto::atproto_callback),
         )
         .route("/api/auth/logout", axum::routing::post(oauth::logout))
+        // User profile lookup (public)
+        .route(
+            "/api/users/{nickname}",
+            axum::routing::get(rest_api::get_user_profile),
+        )
         // Authenticated user endpoints
         .route("/api/me", axum::routing::get(rest_api::get_me))
         .route(

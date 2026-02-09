@@ -211,9 +211,10 @@ fn handle_names(engine: &ChatEngine, nick: &str, msg: &IrcMessage) -> Vec<String
     };
 
     match engine.get_members(channel) {
-        Ok(members) => {
+        Ok(member_infos) => {
+            let nicks: Vec<String> = member_infos.iter().map(|m| m.nickname.clone()).collect();
             vec![
-                formatter::rpl_namreply(nick, channel, &members),
+                formatter::rpl_namreply(nick, channel, &nicks),
                 formatter::rpl_endofnames(nick, channel),
             ]
         }
@@ -250,11 +251,11 @@ fn handle_who(engine: &ChatEngine, nick: &str, msg: &IrcMessage) -> Vec<String> 
                     super::numerics::RPL_WHOREPLY,
                     nick,
                     target,
-                    member,
+                    member.nickname,
                     formatter::server_name(),
                     formatter::server_name(),
-                    member,
-                    member,
+                    member.nickname,
+                    member.nickname,
                 ));
             }
         }
