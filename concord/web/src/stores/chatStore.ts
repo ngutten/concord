@@ -1,5 +1,6 @@
 import { create } from 'zustand';
-import type { ChannelInfo, HistoryMessage, MemberInfo, ServerEvent, ServerInfo } from '../api/types';
+import type { AttachmentInfo, ChannelInfo, HistoryMessage, MemberInfo, ReplyInfo, ServerEvent, ServerInfo } from '../api/types';
+import { listServerEmoji } from '../api/client';
 import { channelKey } from '../api/types';
 import { WebSocketManager } from '../api/websocket';
 
@@ -12,6 +13,9 @@ const EMPTY_MESSAGES_MAP: Record<string, HistoryMessage[]> = {};
 const EMPTY_MEMBERS_MAP: Record<string, MemberInfo[]> = {};
 const EMPTY_HAS_MORE: Record<string, boolean> = {};
 const EMPTY_AVATARS: Record<string, string> = {};
+const EMPTY_TYPING: Record<string, string[]> = {};
+const EMPTY_UNREAD: Record<string, number> = {};
+const EMPTY_EMOJI: Record<string, Record<string, string>> = {};
 
 interface ChatState {
   connected: boolean;
@@ -23,12 +27,28 @@ interface ChatState {
   hasMore: Record<string, boolean>;           // channelKey -> has_more
   /** nickname -> avatar_url cache (populated from Names/Join/Message events) */
   avatars: Record<string, string>;
+  /** channelKey -> list of nicknames currently typing */
+  typingUsers: Record<string, string[]>;
+  /** The message being replied to (if any) */
+  replyingTo: ReplyInfo | null;
+  /** channelKey -> unread message count */
+  unreadCounts: Record<string, number>;
+  /** server_id -> { emoji_name -> image_url } */
+  customEmoji: Record<string, Record<string, string>>;
   ws: WebSocketManager | null;
 
   connect: (nickname: string) => void;
   disconnect: () => void;
   handleEvent: (event: ServerEvent) => void;
-  sendMessage: (serverId: string, channel: string, content: string) => void;
+  sendMessage: (serverId: string, channel: string, content: string, attachments?: AttachmentInfo[]) => void;
+  editMessage: (messageId: string, content: string) => void;
+  deleteMessage: (messageId: string) => void;
+  addReaction: (messageId: string, emoji: string) => void;
+  removeReaction: (messageId: string, emoji: string) => void;
+  sendTyping: (serverId: string, channel: string) => void;
+  setReplyingTo: (reply: ReplyInfo | null) => void;
+  markRead: (serverId: string, channel: string, messageId: string) => void;
+  getUnreadCounts: (serverId: string) => void;
   joinChannel: (serverId: string, channel: string) => void;
   partChannel: (serverId: string, channel: string) => void;
   setTopic: (serverId: string, channel: string, topic: string) => void;
@@ -42,6 +62,7 @@ interface ChatState {
   createChannel: (serverId: string, name: string) => void;
   deleteChannel: (serverId: string, channel: string) => void;
   deleteServer: (serverId: string) => void;
+  loadServerEmoji: (serverId: string) => void;
 }
 
 /** Cache an avatar_url for a nickname if present. */
@@ -61,6 +82,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
   members: EMPTY_MEMBERS_MAP,
   hasMore: EMPTY_HAS_MORE,
   avatars: EMPTY_AVATARS,
+  typingUsers: EMPTY_TYPING,
+  replyingTo: null,
+  unreadCounts: EMPTY_UNREAD,
+  customEmoji: EMPTY_EMOJI,
   ws: null,
 
   connect: (nickname: string) => {
@@ -99,6 +124,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       members: EMPTY_MEMBERS_MAP,
       hasMore: EMPTY_HAS_MORE,
       avatars: EMPTY_AVATARS,
+      typingUsers: EMPTY_TYPING,
+      replyingTo: null,
+      unreadCounts: EMPTY_UNREAD,
+      customEmoji: EMPTY_EMOJI,
     });
   },
 
@@ -112,14 +141,131 @@ export const useChatStore = create<ChatState>((set, get) => ({
           from: event.from,
           content: event.content,
           timestamp: event.timestamp,
+          reply_to: event.reply_to,
+          attachments: event.attachments,
         };
+        set((s) => {
+          // Increment unread count for messages from others
+          const newUnread = { ...s.unreadCounts };
+          if (event.from !== s.nickname) {
+            newUnread[key] = (newUnread[key] || 0) + 1;
+          }
+          return {
+            messages: {
+              ...s.messages,
+              [key]: [...(s.messages[key] || []), msg],
+            },
+            avatars: cacheAvatar(s.avatars, event.from, event.avatar_url),
+            unreadCounts: newUnread,
+          };
+        });
+        break;
+      }
+
+      case 'message_edit': {
+        const key = channelKey(event.server_id, event.channel);
         set((s) => ({
           messages: {
             ...s.messages,
-            [key]: [...(s.messages[key] || []), msg],
+            [key]: (s.messages[key] || []).map((m) =>
+              m.id === event.id ? { ...m, content: event.content, edited_at: event.edited_at } : m,
+            ),
           },
-          avatars: cacheAvatar(s.avatars, event.from, event.avatar_url),
         }));
+        break;
+      }
+
+      case 'message_delete': {
+        const key = channelKey(event.server_id, event.channel);
+        set((s) => ({
+          messages: {
+            ...s.messages,
+            [key]: (s.messages[key] || []).filter((m) => m.id !== event.id),
+          },
+        }));
+        break;
+      }
+
+      case 'message_embed': {
+        const key = channelKey(event.server_id, event.channel);
+        set((s) => ({
+          messages: {
+            ...s.messages,
+            [key]: (s.messages[key] || []).map((m) =>
+              m.id === event.message_id ? { ...m, embeds: event.embeds } : m,
+            ),
+          },
+        }));
+        break;
+      }
+
+      case 'reaction_add': {
+        const key = channelKey(event.server_id, event.channel);
+        set((s) => ({
+          messages: {
+            ...s.messages,
+            [key]: (s.messages[key] || []).map((m) => {
+              if (m.id !== event.message_id) return m;
+              const reactions = [...(m.reactions || [])];
+              const existing = reactions.find((r) => r.emoji === event.emoji);
+              if (existing) {
+                if (!existing.user_ids.includes(event.user_id)) {
+                  existing.user_ids = [...existing.user_ids, event.user_id];
+                  existing.count = existing.user_ids.length;
+                }
+              } else {
+                reactions.push({ emoji: event.emoji, count: 1, user_ids: [event.user_id] });
+              }
+              return { ...m, reactions };
+            }),
+          },
+        }));
+        break;
+      }
+
+      case 'reaction_remove': {
+        const key = channelKey(event.server_id, event.channel);
+        set((s) => ({
+          messages: {
+            ...s.messages,
+            [key]: (s.messages[key] || []).map((m) => {
+              if (m.id !== event.message_id) return m;
+              let reactions = (m.reactions || [])
+                .map((r) => {
+                  if (r.emoji !== event.emoji) return r;
+                  const user_ids = r.user_ids.filter((uid) => uid !== event.user_id);
+                  return { ...r, user_ids, count: user_ids.length };
+                })
+                .filter((r) => r.count > 0);
+              if (reactions.length === 0) reactions = [];
+              return { ...m, reactions };
+            }),
+          },
+        }));
+        break;
+      }
+
+      case 'typing_start': {
+        const key = channelKey(event.server_id, event.channel);
+        const myNick = get().nickname;
+        if (event.nickname === myNick) break; // Don't show own typing
+        set((s) => {
+          const current = s.typingUsers[key] || [];
+          if (current.includes(event.nickname)) return s;
+          return {
+            typingUsers: { ...s.typingUsers, [key]: [...current, event.nickname] },
+          };
+        });
+        // Auto-expire after 8 seconds
+        setTimeout(() => {
+          set((s) => {
+            const current = s.typingUsers[key] || [];
+            const filtered = current.filter((n) => n !== event.nickname);
+            return {
+              typingUsers: { ...s.typingUsers, [key]: filtered },
+            };
+          });
+        }, 8000);
         break;
       }
 
@@ -224,6 +370,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
         break;
       }
 
+      case 'unread_counts': {
+        set((s) => {
+          const newUnread = { ...s.unreadCounts };
+          for (const { channel_name, count } of event.counts) {
+            const key = channelKey(event.server_id, channel_name);
+            newUnread[key] = count;
+          }
+          return { unreadCounts: newUnread };
+        });
+        break;
+      }
+
       case 'error': {
         console.error(`Server error [${event.code}]: ${event.message}`);
         break;
@@ -231,8 +389,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  sendMessage: (serverId, channel, content) => {
-    const { ws, nickname } = get();
+  sendMessage: (serverId, channel, content, attachments) => {
+    const { ws, nickname, replyingTo } = get();
     if (!ws || !nickname) return;
 
     const key = channelKey(serverId, channel);
@@ -243,15 +401,64 @@ export const useChatStore = create<ChatState>((set, get) => ({
       from: nickname,
       content,
       timestamp: new Date().toISOString(),
+      reply_to: replyingTo,
+      attachments: attachments || null,
     };
     set((s) => ({
       messages: {
         ...s.messages,
         [key]: [...(s.messages[key] || []), msg],
       },
+      replyingTo: null,
     }));
 
-    ws.send({ type: 'send_message', server_id: serverId, channel, content });
+    ws.send({
+      type: 'send_message',
+      server_id: serverId,
+      channel,
+      content,
+      reply_to: replyingTo?.id,
+      attachment_ids: attachments?.map((a) => a.id),
+    });
+  },
+
+  editMessage: (messageId, content) => {
+    get().ws?.send({ type: 'edit_message', message_id: messageId, content });
+  },
+
+  deleteMessage: (messageId) => {
+    get().ws?.send({ type: 'delete_message', message_id: messageId });
+  },
+
+  addReaction: (messageId, emoji) => {
+    get().ws?.send({ type: 'add_reaction', message_id: messageId, emoji });
+  },
+
+  removeReaction: (messageId, emoji) => {
+    get().ws?.send({ type: 'remove_reaction', message_id: messageId, emoji });
+  },
+
+  sendTyping: (serverId, channel) => {
+    get().ws?.send({ type: 'typing', server_id: serverId, channel });
+  },
+
+  setReplyingTo: (reply) => {
+    set({ replyingTo: reply });
+  },
+
+  markRead: (serverId, channel, messageId) => {
+    const key = channelKey(serverId, channel);
+    get().ws?.send({ type: 'mark_read', server_id: serverId, channel, message_id: messageId });
+    // Optimistically clear unread count
+    set((s) => {
+      const newUnread = { ...s.unreadCounts };
+      delete newUnread[key];
+      return { unreadCounts: newUnread };
+    });
+  },
+
+  getUnreadCounts: (serverId) => {
+    get().ws?.send({ type: 'get_unread_counts', server_id: serverId });
   },
 
   joinChannel: (serverId, channel) => {
@@ -304,5 +511,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   deleteServer: (serverId) => {
     get().ws?.send({ type: 'delete_server', server_id: serverId });
+  },
+
+  loadServerEmoji: (serverId) => {
+    listServerEmoji(serverId)
+      .then((emojis) => {
+        const map: Record<string, string> = {};
+        for (const e of emojis) {
+          map[e.name] = e.image_url;
+        }
+        set((s) => ({
+          customEmoji: { ...s.customEmoji, [serverId]: map },
+        }));
+      })
+      .catch((err) => {
+        console.error('Failed to load emoji for server', serverId, err);
+      });
   },
 }));

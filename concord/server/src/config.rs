@@ -12,6 +12,7 @@ pub struct ServerConfig {
     pub database: DatabaseSection,
     pub auth: AuthSection,
     pub oauth: OAuthSection,
+    pub storage: StorageSection,
 }
 
 #[derive(Deserialize)]
@@ -73,6 +74,22 @@ pub struct OAuthSection {
 pub struct OAuthProviderSection {
     pub client_id: String,
     pub client_secret: String,
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+pub struct StorageSection {
+    pub upload_dir: String,
+    pub max_file_size_mb: u64,
+}
+
+impl Default for StorageSection {
+    fn default() -> Self {
+        Self {
+            upload_dir: "uploads".into(),
+            max_file_size_mb: 100,
+        }
+    }
 }
 
 impl ServerConfig {
@@ -137,6 +154,15 @@ impl ServerConfig {
                 client_id: id,
                 client_secret: secret,
             });
+        }
+        // Storage env overrides
+        if let Ok(v) = std::env::var("UPLOAD_DIR") {
+            self.storage.upload_dir = v;
+        }
+        if let Ok(v) = std::env::var("MAX_FILE_SIZE_MB")
+            && let Ok(mb) = v.parse()
+        {
+            self.storage.max_file_size_mb = mb;
         }
     }
 

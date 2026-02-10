@@ -34,11 +34,49 @@ export interface MemberInfo {
   avatar_url?: string | null;
 }
 
+export interface ReplyInfo {
+  id: string;
+  from: string;
+  content_preview: string;
+}
+
+export interface ReactionGroup {
+  emoji: string;
+  count: number;
+  user_ids: string[];
+}
+
+export interface AttachmentInfo {
+  id: string;
+  filename: string;
+  content_type: string;
+  file_size: number;
+  url: string;
+}
+
+export interface EmbedInfo {
+  url: string;
+  title?: string | null;
+  description?: string | null;
+  image_url?: string | null;
+  site_name?: string | null;
+}
+
 export interface HistoryMessage {
   id: string;
   from: string;
   content: string;
   timestamp: string;
+  edited_at?: string | null;
+  reply_to?: ReplyInfo | null;
+  reactions?: ReactionGroup[] | null;
+  attachments?: AttachmentInfo[] | null;
+  embeds?: EmbedInfo[] | null;
+}
+
+export interface UnreadCount {
+  channel_name: string;
+  count: number;
 }
 
 export interface PublicUserProfile {
@@ -71,7 +109,13 @@ export interface CreateTokenResponse {
 
 // Server → Client events
 export type ServerEvent =
-  | { type: 'message'; id: string; server_id?: string; from: string; target: string; content: string; timestamp: string; avatar_url?: string }
+  | { type: 'message'; id: string; server_id?: string; from: string; target: string; content: string; timestamp: string; avatar_url?: string; reply_to?: ReplyInfo | null; attachments?: AttachmentInfo[] | null }
+  | { type: 'message_edit'; id: string; server_id: string; channel: string; content: string; edited_at: string }
+  | { type: 'message_delete'; id: string; server_id: string; channel: string }
+  | { type: 'message_embed'; message_id: string; server_id: string; channel: string; embeds: EmbedInfo[] }
+  | { type: 'reaction_add'; message_id: string; server_id: string; channel: string; user_id: string; nickname: string; emoji: string }
+  | { type: 'reaction_remove'; message_id: string; server_id: string; channel: string; user_id: string; nickname: string; emoji: string }
+  | { type: 'typing_start'; server_id: string; channel: string; nickname: string }
   | { type: 'join'; nickname: string; server_id: string; channel: string; avatar_url?: string }
   | { type: 'part'; nickname: string; server_id: string; channel: string; reason?: string }
   | { type: 'quit'; nickname: string; reason?: string }
@@ -82,12 +126,18 @@ export type ServerEvent =
   | { type: 'channel_list'; server_id: string; channels: ChannelInfo[] }
   | { type: 'history'; server_id: string; channel: string; messages: HistoryMessage[]; has_more: boolean }
   | { type: 'server_list'; servers: ServerInfo[] }
+  | { type: 'unread_counts'; server_id: string; counts: UnreadCount[] }
   | { type: 'server_notice'; message: string }
   | { type: 'error'; code: string; message: string };
 
 // Client → Server commands
 export type ClientCommand =
-  | { type: 'send_message'; server_id: string; channel: string; content: string }
+  | { type: 'send_message'; server_id: string; channel: string; content: string; reply_to?: string; attachment_ids?: string[] }
+  | { type: 'edit_message'; message_id: string; content: string }
+  | { type: 'delete_message'; message_id: string }
+  | { type: 'add_reaction'; message_id: string; emoji: string }
+  | { type: 'remove_reaction'; message_id: string; emoji: string }
+  | { type: 'typing'; server_id: string; channel: string }
   | { type: 'join_channel'; server_id: string; channel: string }
   | { type: 'part_channel'; server_id: string; channel: string; reason?: string }
   | { type: 'set_topic'; server_id: string; channel: string; topic: string }
@@ -101,7 +151,9 @@ export type ClientCommand =
   | { type: 'create_channel'; server_id: string; name: string }
   | { type: 'delete_channel'; server_id: string; channel: string }
   | { type: 'delete_server'; server_id: string }
-  | { type: 'update_member_role'; server_id: string; user_id: string; role: string };
+  | { type: 'update_member_role'; server_id: string; user_id: string; role: string }
+  | { type: 'mark_read'; server_id: string; channel: string; message_id: string }
+  | { type: 'get_unread_counts'; server_id: string };
 
 // ── Helpers ─────────────────────────────────────────────
 

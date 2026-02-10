@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use sqlx::SqlitePool;
@@ -13,4 +14,6 @@ pub struct AppState {
     pub db: SqlitePool,
     pub auth_config: AuthConfig,
     pub atproto: AtprotoOAuth,
+    pub upload_dir: PathBuf,
+    pub max_file_size: u64,
 }

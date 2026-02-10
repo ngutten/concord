@@ -1,0 +1,34 @@
+# Rust build artifacts
+concord/target/
+
+# SQLite runtime files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Server runtime
+concord/server/server.log
+concord/server/uploads/
+
+# Frontend build output (served by axum, rebuild with `npm run build`)
+concord/server/static/assets/
+
+# Environment / secrets
+.env
+.env.*
+
+# Chainlink local state (rules are tracked, but runtime state is not)
+.chainlink/.cache/
+.chainlink/issues.db
+.chainlink/session.json
+.chainlink/hook-config.json
+concord/server/.chainlink/
+concord/web/.chainlink/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

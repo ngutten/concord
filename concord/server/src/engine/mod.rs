@@ -1,5 +1,6 @@
 pub mod channel;
 pub mod chat_engine;
+pub mod embeds;
 pub mod events;
 pub mod permissions;
 pub mod rate_limiter;

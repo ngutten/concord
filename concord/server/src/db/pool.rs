@@ -39,6 +39,22 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let migrations: &[(i64, &str)] = &[
         (1, include_str!("../../migrations/001_initial.sql")),
         (2, include_str!("../../migrations/002_servers.sql")),
+        (
+            3,
+            include_str!("../../migrations/003_messaging_enhancements.sql"),
+        ),
+        (
+            4,
+            include_str!("../../migrations/004_media_files.sql"),
+        ),
+        (
+            5,
+            include_str!("../../migrations/005_atproto_blob_storage.sql"),
+        ),
+        (
+            6,
+            include_str!("../../migrations/006_server_config.sql"),
+        ),
     ];
 
     for &(version, sql) in migrations {

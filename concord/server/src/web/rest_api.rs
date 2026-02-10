@@ -1,15 +1,18 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::body::Body;
+use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
+use axum::http::header;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
-use tracing::error;
+use tokio_util::io::ReaderStream;
+use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::auth::token::{generate_irc_token, hash_irc_token};
-use crate::db::queries::{servers, users};
+use crate::db::queries::{attachments, emoji, servers, users};
 use crate::engine::events::HistoryMessage;
 
 use super::app_state::AppState;
@@ -463,6 +466,312 @@ pub async fn delete_irc_token(
         Ok(false) => (StatusCode::NOT_FOUND, "Token not found").into_response(),
         Err(e) => {
             error!(error = %e, "Failed to delete IRC token");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
+        }
+    }
+}
+
+// ── File upload endpoints ─────────────────────────────────
+
+#[derive(Serialize)]
+pub struct UploadResponse {
+    pub id: String,
+    pub filename: String,
+    pub content_type: String,
+    pub file_size: i64,
+    pub url: String,
+}
+
+/// POST /api/uploads — upload a file (multipart form data).
+pub async fn upload_file(
+    State(state): State<Arc<AppState>>,
+    auth: AuthUser,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let mut file_data: Option<(String, String, Vec<u8>)> = None; // (filename, content_type, bytes)
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        if field.name() == Some("file") {
+            let filename = field
+                .file_name()
+                .unwrap_or("unnamed")
+                .to_string();
+            let content_type = field
+                .content_type()
+                .unwrap_or("application/octet-stream")
+                .to_string();
+
+            match field.bytes().await {
+                Ok(bytes) => {
+                    if bytes.len() as u64 > state.max_file_size {
+                        return (
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            format!(
+                                "File too large. Max size is {} MB",
+                                state.max_file_size / (1024 * 1024)
+                            ),
+                        )
+                            .into_response();
+                    }
+                    file_data = Some((filename, content_type, bytes.to_vec()));
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to read upload data");
+                    return (StatusCode::BAD_REQUEST, "Failed to read file data").into_response();
+                }
+            }
+            break;
+        }
+    }
+
+    let Some((original_filename, content_type, bytes)) = file_data else {
+        return (StatusCode::BAD_REQUEST, "No file field in upload").into_response();
+    };
+
+    let file_size = bytes.len() as i64;
+    let attachment_id = Uuid::new_v4().to_string();
+
+    // Sanitize filename: keep only the last path component, replace unsafe chars
+    let safe_filename = original_filename
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("file");
+
+    // Try uploading to the user's PDS (AT Protocol blob storage) first
+    let public_url = &state.auth_config.public_url;
+    let client_id = format!("{}/api/auth/atproto/v2/client-metadata.json", public_url);
+    let redirect_uri = format!("{}/api/auth/atproto/callback", public_url);
+    match super::pds_client::upload_blob_to_pds(
+        &state.db,
+        &auth.user_id,
+        bytes.clone(),
+        &content_type,
+        &state.atproto.signing_key,
+        &client_id,
+        &redirect_uri,
+    )
+    .await
+    {
+        Ok(blob_ref) => {
+            info!(
+                user_id = %auth.user_id,
+                cid = %blob_ref.cid,
+                "Uploaded blob to PDS"
+            );
+            if let Err(e) = attachments::insert_attachment_with_blob(
+                &state.db,
+                &attachments::InsertBlobAttachmentParams {
+                    id: &attachment_id,
+                    uploader_id: &auth.user_id,
+                    filename: &attachment_id,
+                    original_filename: safe_filename,
+                    content_type: &content_type,
+                    file_size,
+                    blob_cid: &blob_ref.cid,
+                    blob_url: &blob_ref.url,
+                },
+            )
+            .await
+            {
+                error!(error = %e, "Failed to insert blob attachment record");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
+            }
+
+            let url = format!("/api/uploads/{}", attachment_id);
+            return (
+                StatusCode::CREATED,
+                Json(UploadResponse {
+                    id: attachment_id,
+                    filename: safe_filename.to_string(),
+                    content_type,
+                    file_size,
+                    url,
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            // No AT Protocol credentials or PDS upload failed — fall back to local storage
+            info!(error = %e, "PDS blob upload unavailable, using local storage");
+        }
+    }
+
+    // Fallback: store on disk as {upload_dir}/{id}
+    let file_path = state.upload_dir.join(&attachment_id);
+    if let Err(e) = tokio::fs::write(&file_path, &bytes).await {
+        error!(error = %e, "Failed to write upload to disk");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to store file").into_response();
+    }
+
+    // Insert DB record (local storage, no blob fields)
+    if let Err(e) = attachments::insert_attachment(
+        &state.db,
+        &attachment_id,
+        &auth.user_id,
+        &attachment_id, // storage filename = id
+        safe_filename,
+        &content_type,
+        file_size,
+    )
+    .await
+    {
+        error!(error = %e, "Failed to insert attachment record");
+        let _ = tokio::fs::remove_file(&file_path).await;
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
+    }
+
+    let url = format!("/api/uploads/{}", attachment_id);
+
+    (
+        StatusCode::CREATED,
+        Json(UploadResponse {
+            id: attachment_id,
+            filename: safe_filename.to_string(),
+            content_type,
+            file_size,
+            url,
+        }),
+    )
+        .into_response()
+}
+
+/// GET /api/uploads/:id — serve an uploaded file.
+pub async fn get_upload(
+    State(state): State<Arc<AppState>>,
+    Path(attachment_id): Path<String>,
+) -> impl IntoResponse {
+    // Look up attachment metadata
+    let attachment = match attachments::get_attachment(&state.db, &attachment_id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return (StatusCode::NOT_FOUND, "File not found").into_response(),
+        Err(e) => {
+            error!(error = %e, "Failed to look up attachment");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
+        }
+    };
+
+    // If the attachment has a PDS blob URL, redirect to it
+    if let Some(blob_url) = &attachment.blob_url {
+        return axum::response::Redirect::temporary(blob_url).into_response();
+    }
+
+    // Otherwise serve from local disk
+    let file_path = state.upload_dir.join(&attachment_id);
+    let file = match tokio::fs::File::open(&file_path).await {
+        Ok(f) => f,
+        Err(_) => return (StatusCode::NOT_FOUND, "File not found on disk").into_response(),
+    };
+
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+
+    let content_disposition = format!(
+        "inline; filename=\"{}\"",
+        attachment.original_filename.replace('"', "\\\"")
+    );
+
+    (
+        [
+            (header::CONTENT_TYPE, attachment.content_type),
+            (header::CONTENT_DISPOSITION, content_disposition),
+            (
+                header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable".to_string(),
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+// ── Custom emoji endpoints ──────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct EmojiResponse {
+    pub id: String,
+    pub server_id: String,
+    pub name: String,
+    pub image_url: String,
+}
+
+pub async fn list_server_emoji(
+    State(state): State<Arc<AppState>>,
+    Path(server_id): Path<String>,
+) -> impl IntoResponse {
+    match emoji::list_emoji(&state.db, &server_id).await {
+        Ok(rows) => {
+            let list: Vec<EmojiResponse> = rows
+                .into_iter()
+                .map(|r| EmojiResponse {
+                    id: r.id,
+                    server_id: r.server_id,
+                    name: r.name,
+                    image_url: r.image_url,
+                })
+                .collect();
+            Json(list).into_response()
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to list emoji");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CreateEmojiRequest {
+    pub name: String,
+    pub image_url: String,
+}
+
+pub async fn create_server_emoji(
+    State(state): State<Arc<AppState>>,
+    Path(server_id): Path<String>,
+    user: AuthUser,
+    Json(body): Json<CreateEmojiRequest>,
+) -> impl IntoResponse {
+    // Validate emoji name: alphanumeric + underscores, 2-32 chars
+    let name = body.name.trim().to_lowercase();
+    if name.len() < 2 || name.len() > 32 || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Emoji name must be 2-32 alphanumeric/underscore characters",
+        )
+            .into_response();
+    }
+
+    let id = Uuid::new_v4().to_string();
+    match emoji::insert_emoji(&state.db, &id, &server_id, &name, &body.image_url, &user.user_id)
+        .await
+    {
+        Ok(()) => Json(EmojiResponse {
+            id,
+            server_id,
+            name,
+            image_url: body.image_url,
+        })
+        .into_response(),
+        Err(e) => {
+            if e.to_string().contains("UNIQUE") {
+                (StatusCode::CONFLICT, "An emoji with that name already exists").into_response()
+            } else {
+                error!(error = %e, "Failed to create emoji");
+                (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
+            }
+        }
+    }
+}
+
+pub async fn delete_server_emoji(
+    State(state): State<Arc<AppState>>,
+    Path((_server_id, emoji_id)): Path<(String, String)>,
+    _user: AuthUser,
+) -> impl IntoResponse {
+    match emoji::delete_emoji(&state.db, &emoji_id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "Emoji not found").into_response(),
+        Err(e) => {
+            error!(error = %e, "Failed to delete emoji");
             (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
         }
     }

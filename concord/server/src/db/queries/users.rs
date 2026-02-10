@@ -178,6 +178,68 @@ pub async fn get_user_by_nickname(
     Ok(row)
 }
 
+/// AT Protocol credentials stored alongside an OAuth account.
+pub struct AtprotoCredentials {
+    pub did: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub dpop_private_key: String,
+    pub pds_url: String,
+    pub token_expires_at: String,
+}
+
+/// Store AT Protocol credentials (tokens, DPoP key, PDS URL) on an oauth_account.
+pub async fn store_atproto_credentials(
+    pool: &SqlitePool,
+    user_id: &str,
+    access_token: &str,
+    refresh_token: &str,
+    dpop_private_key: &str,
+    pds_url: &str,
+    token_expires_at: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE oauth_accounts SET access_token = ?, refresh_token = ?, \
+         dpop_private_key = ?, pds_url = ?, token_expires_at = ? \
+         WHERE user_id = ? AND provider = 'atproto'",
+    )
+    .bind(access_token)
+    .bind(refresh_token)
+    .bind(dpop_private_key)
+    .bind(pds_url)
+    .bind(token_expires_at)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Get AT Protocol credentials for a user. Returns None if no atproto account or tokens not stored.
+pub async fn get_atproto_credentials(
+    pool: &SqlitePool,
+    user_id: &str,
+) -> Result<Option<AtprotoCredentials>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (String, String, String, String, String, String)>(
+        "SELECT provider_id, access_token, refresh_token, dpop_private_key, pds_url, token_expires_at \
+         FROM oauth_accounts \
+         WHERE user_id = ? AND provider = 'atproto' \
+         AND access_token IS NOT NULL AND dpop_private_key IS NOT NULL",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(did, access_token, refresh_token, dpop_private_key, pds_url, token_expires_at)| {
+        AtprotoCredentials {
+            did,
+            access_token,
+            refresh_token,
+            dpop_private_key,
+            pds_url,
+            token_expires_at,
+        }
+    }))
+}
+
 /// Update last_used timestamp for an IRC token.
 pub async fn touch_irc_token(
     pool: &SqlitePool,

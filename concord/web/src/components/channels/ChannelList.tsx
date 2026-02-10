@@ -1,8 +1,11 @@
+import { useEffect } from 'react';
 import { useChatStore } from '../../stores/chatStore';
 import { useUiStore } from '../../stores/uiStore';
+import { channelKey } from '../../api/types';
 import type { ChannelInfo } from '../../api/types';
 
 const EMPTY_CHANNELS: ChannelInfo[] = [];
+const EMPTY_UNREAD: Record<string, number> = {};
 
 export function ChannelList() {
   const activeServer = useUiStore((s) => s.activeServer);
@@ -13,8 +16,30 @@ export function ChannelList() {
   const getMembers = useChatStore((s) => s.getMembers);
   const fetchHistory = useChatStore((s) => s.fetchHistory);
   const servers = useChatStore((s) => s.servers);
+  const unreadCounts = useChatStore((s) => s.unreadCounts ?? EMPTY_UNREAD);
+  const markRead = useChatStore((s) => s.markRead);
+  const getUnreadCounts = useChatStore((s) => s.getUnreadCounts);
+  const messages = useChatStore((s) => s.messages);
 
   const serverName = servers.find((s) => s.id === activeServer)?.name ?? 'Concord';
+
+  // Fetch unread counts when server changes
+  useEffect(() => {
+    if (activeServer) {
+      getUnreadCounts(activeServer);
+    }
+  }, [activeServer, getUnreadCounts]);
+
+  // Auto-mark-read when viewing a channel (clear unread for active channel)
+  useEffect(() => {
+    if (!activeServer || !activeChannel) return;
+    const key = channelKey(activeServer, activeChannel);
+    const channelMessages = messages[key];
+    if (channelMessages && channelMessages.length > 0) {
+      const lastMsg = channelMessages[channelMessages.length - 1];
+      markRead(activeServer, activeChannel, lastMsg.id);
+    }
+  }, [activeServer, activeChannel, messages, markRead]);
 
   const handleSelect = (name: string) => {
     if (!activeServer) return;
@@ -37,20 +62,33 @@ export function ChannelList() {
           </span>
         </div>
 
-        {channels.map((ch) => (
-          <button
-            key={ch.name}
-            onClick={() => handleSelect(ch.name)}
-            className={`mb-0.5 flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm transition-colors ${
-              activeChannel === ch.name
-                ? 'bg-bg-active text-text-primary'
-                : 'text-text-muted hover:bg-bg-hover hover:text-text-secondary'
-            }`}
-          >
-            <span className="text-lg leading-none text-text-muted">#</span>
-            <span className="truncate">{ch.name.replace(/^#/, '')}</span>
-          </button>
-        ))}
+        {channels.map((ch) => {
+          const key = channelKey(activeServer!, ch.name);
+          const unread = unreadCounts[key] || 0;
+          const isActive = activeChannel === ch.name;
+
+          return (
+            <button
+              key={ch.name}
+              onClick={() => handleSelect(ch.name)}
+              className={`mb-0.5 flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm transition-colors ${
+                isActive
+                  ? 'bg-bg-active text-text-primary'
+                  : unread > 0
+                    ? 'text-text-primary font-semibold hover:bg-bg-hover'
+                    : 'text-text-muted hover:bg-bg-hover hover:text-text-secondary'
+              }`}
+            >
+              <span className="text-lg leading-none text-text-muted">#</span>
+              <span className="min-w-0 flex-1 truncate">{ch.name.replace(/^#/, '')}</span>
+              {unread > 0 && !isActive && (
+                <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-red-500 px-1.5 text-xs font-bold text-white">
+                  {unread > 99 ? '99+' : unread}
+                </span>
+              )}
+            </button>
+          );
+        })}
       </div>
 
       <div className="border-t border-border-primary px-2 py-2">

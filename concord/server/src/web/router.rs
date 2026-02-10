@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -79,6 +80,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             axum::routing::get(atproto::client_metadata),
         )
         .route(
+            "/api/auth/atproto/v2/client-metadata.json",
+            axum::routing::get(atproto::client_metadata),
+        )
+        .route(
             "/api/auth/atproto/login",
             axum::routing::get(atproto::atproto_login),
         )
@@ -101,6 +106,26 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/tokens/{id}",
             axum::routing::delete(rest_api::delete_irc_token),
+        )
+        // File upload/download
+        .route(
+            "/api/uploads",
+            axum::routing::post(rest_api::upload_file)
+                .layer(DefaultBodyLimit::max(state.max_file_size as usize)),
+        )
+        .route(
+            "/api/uploads/{id}",
+            axum::routing::get(rest_api::get_upload),
+        )
+        // Custom emoji
+        .route(
+            "/api/servers/{id}/emoji",
+            axum::routing::get(rest_api::list_server_emoji)
+                .post(rest_api::create_server_emoji),
+        )
+        .route(
+            "/api/servers/{id}/emoji/{emoji_id}",
+            axum::routing::delete(rest_api::delete_server_emoji),
         )
         // Static files with SPA fallback — unmatched routes serve index.html
         .fallback_service(ServeDir::new("static").fallback(ServeFile::new("static/index.html")))

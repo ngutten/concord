@@ -1,11 +1,5 @@
 /target/
 /server/target/
-*.db
-*.db-journal
-*.db-wal
-*.db-shm
 .env
 node_modules/
 /web/dist/
-/concord/server/concord.db-shm
-

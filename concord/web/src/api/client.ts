@@ -1,4 +1,4 @@
-import type { AuthStatus, ChannelInfo, CreateTokenResponse, HistoryResponse, IrcToken, PublicUserProfile, ServerInfo, UserProfile } from './types';
+import type { AttachmentInfo, AuthStatus, ChannelInfo, CreateTokenResponse, HistoryResponse, IrcToken, PublicUserProfile, ServerInfo, UserProfile } from './types';
 
 const BASE = '/api';
 
@@ -79,3 +79,43 @@ export const adminSetAdmin = (userId: string, isAdmin: boolean) =>
     method: 'PUT',
     body: JSON.stringify({ is_admin: isAdmin }),
   });
+
+// Custom emoji
+export interface CustomEmoji {
+  id: string;
+  server_id: string;
+  name: string;
+  image_url: string;
+}
+
+export const listServerEmoji = (serverId: string) =>
+  request<CustomEmoji[]>(`/servers/${encodeURIComponent(serverId)}/emoji`);
+export const createServerEmoji = (serverId: string, name: string, imageUrl: string) =>
+  request<CustomEmoji>(`/servers/${encodeURIComponent(serverId)}/emoji`, {
+    method: 'POST',
+    body: JSON.stringify({ name, image_url: imageUrl }),
+  });
+export const deleteServerEmoji = (serverId: string, emojiId: string) =>
+  request<void>(`/servers/${encodeURIComponent(serverId)}/emoji/${encodeURIComponent(emojiId)}`, {
+    method: 'DELETE',
+  });
+
+// File uploads
+export async function uploadFile(file: File): Promise<AttachmentInfo> {
+  const formData = new FormData();
+  formData.append('file', file);
+
+  const res = await fetch(`${BASE}/uploads`, {
+    method: 'POST',
+    credentials: 'include',
+    body: formData,
+    // Don't set Content-Type — browser sets it with multipart boundary
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(text || `Upload failed: HTTP ${res.status}`);
+  }
+
+  return res.json();
+}

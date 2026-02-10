@@ -8,7 +8,10 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use super::channel::ChannelState;
-use super::events::{ChannelInfo, ChatEvent, HistoryMessage, MemberInfo, ServerInfo, SessionId};
+use super::events::{
+    ChannelInfo, ChatEvent, HistoryMessage, MemberInfo, ReactionGroup, ReplyInfo, ServerInfo,
+    SessionId,
+};
 use super::permissions::ServerRole;
 use super::rate_limiter::RateLimiter;
 use super::server::ServerState;
@@ -37,6 +40,8 @@ pub struct ChatEngine {
     db: Option<SqlitePool>,
     /// Per-user message rate limiter (burst of 10, refill 1 per second).
     message_limiter: RateLimiter,
+    /// HTTP client for outbound requests (link embed unfurling).
+    http_client: reqwest::Client,
 }
 
 impl ChatEngine {
@@ -49,6 +54,7 @@ impl ChatEngine {
             nick_to_session: DashMap::new(),
             db,
             message_limiter: RateLimiter::new(10, 1.0),
+            http_client: reqwest::Client::new(),
         }
     }
 
@@ -587,13 +593,15 @@ impl ChatEngine {
         Ok(())
     }
 
-    /// Send a message to a channel or user (DM).
+    /// Send a message to a channel or user (DM), with optional reply and attachments.
     pub fn send_message(
         &self,
         session_id: SessionId,
         server_id: &str,
         target: &str,
         content: &str,
+        reply_to_id: Option<&str>,
+        attachment_ids: Option<&[String]>,
     ) -> Result<(), String> {
         validation::validate_message(content)?;
 
@@ -607,6 +615,71 @@ impl ChatEngine {
             return Err("Rate limit exceeded. Please slow down.".into());
         }
 
+        // Build reply info if replying to a message
+        let reply_to: Option<ReplyInfo> = if let Some(ref_id) = reply_to_id {
+            if let Some(pool) = &self.db {
+                // Synchronous lookup via block_in_place — reply info is needed before broadcast
+                let pool = pool.clone();
+                let ref_id = ref_id.to_string();
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        match crate::db::queries::messages::get_message_by_id(&pool, &ref_id).await
+                        {
+                            Ok(Some(row)) => Some(ReplyInfo {
+                                id: row.id,
+                                from: row.sender_nick,
+                                content_preview: row.content.chars().take(100).collect::<String>(),
+                            }),
+                            _ => None,
+                        }
+                    })
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Look up attachment metadata if attachment_ids provided
+        let attachments: Option<Vec<super::events::AttachmentInfo>> =
+            if let Some(ids) = attachment_ids
+                && !ids.is_empty()
+            {
+                if let Some(pool) = &self.db {
+                    let pool = pool.clone();
+                    let ids = ids.to_vec();
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            let infos =
+                                crate::db::queries::attachments::get_attachments_by_ids(&pool, &ids)
+                                    .await
+                                    .unwrap_or_default();
+                            if infos.is_empty() {
+                                None
+                            } else {
+                                Some(
+                                    infos
+                                        .into_iter()
+                                        .map(|a| super::events::AttachmentInfo {
+                                            id: a.id.clone(),
+                                            filename: a.original_filename,
+                                            content_type: a.content_type,
+                                            file_size: a.file_size,
+                                            url: format!("/api/uploads/{}", a.id),
+                                        })
+                                        .collect(),
+                                )
+                            }
+                        })
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
         let msg_id = Uuid::new_v4();
         let event = ChatEvent::Message {
             id: msg_id,
@@ -616,6 +689,8 @@ impl ChatEngine {
             content: content.to_string(),
             timestamp: Utc::now(),
             avatar_url: session.avatar_url.clone(),
+            reply_to: reply_to.clone(),
+            attachments: attachments.clone(),
         };
 
         if target.starts_with('#') {
@@ -641,18 +716,103 @@ impl ChatEngine {
                 let sid = session_id.to_string();
                 let nick = session.nickname.clone();
                 let msg = content.to_string();
+                let reply_id = reply_to_id.map(|s| s.to_string());
+                let att_ids = attachment_ids.map(|ids| ids.to_vec());
                 tokio::spawn(async move {
-                    if let Err(e) = crate::db::queries::messages::insert_message(
-                        &pool, &id, &srv, &ch, &sid, &nick, &msg,
-                    )
-                    .await
+                    let params = crate::db::queries::messages::InsertMessageParams {
+                        id: &id,
+                        server_id: &srv,
+                        channel_id: &ch,
+                        sender_id: &sid,
+                        sender_nick: &nick,
+                        content: &msg,
+                        reply_to_id: reply_id.as_deref(),
+                    };
+                    if let Err(e) =
+                        crate::db::queries::messages::insert_message(&pool, &params).await
                     {
                         error!(error = %e, "failed to persist message");
+                    }
+                    // Link attachments to the message
+                    if let Some(att_ids) = att_ids
+                        && let Err(e) =
+                            crate::db::queries::attachments::link_attachments_to_message(
+                                &pool, &id, &att_ids, &sid,
+                            )
+                            .await
+                    {
+                        error!(error = %e, "failed to link attachments");
                     }
                 });
             }
 
             self.broadcast_to_channel(&channel_id, &event, Some(session_id));
+
+            // Async link embed unfurling — extract URLs and resolve OG metadata
+            let urls = super::embeds::extract_urls(content);
+            if !urls.is_empty()
+                && let Some(pool) = &self.db
+            {
+                    let pool = pool.clone();
+                    let client = self.http_client.clone();
+                    let server_id_owned = server_id.to_string();
+                    let channel_name_owned = channel_name.clone();
+                    // Collect senders for channel members before spawning
+                    let member_senders: Vec<mpsc::UnboundedSender<ChatEvent>> =
+                        if let Some(channel) = self.channels.get(&channel_id) {
+                            channel
+                                .members
+                                .iter()
+                                .filter_map(|sid| {
+                                    self.sessions.get(sid).map(|s| s.outbound.clone())
+                                })
+                                .collect()
+                        } else {
+                            vec![]
+                        };
+                    tokio::spawn(async move {
+                        let mut embeds = Vec::new();
+                        for url in urls {
+                            // Check cache first
+                            if let Ok(Some(cached)) =
+                                crate::db::queries::embeds::get_cached_embed(&pool, &url).await
+                            {
+                                embeds.push(super::events::EmbedInfo {
+                                    url: cached.url,
+                                    title: cached.title,
+                                    description: cached.description,
+                                    image_url: cached.image_url,
+                                    site_name: cached.site_name,
+                                });
+                                continue;
+                            }
+                            // Unfurl
+                            if let Some(info) = super::embeds::unfurl_url(&client, &url).await {
+                                let _ = crate::db::queries::embeds::upsert_embed(
+                                    &pool,
+                                    &info.url,
+                                    info.title.as_deref(),
+                                    info.description.as_deref(),
+                                    info.image_url.as_deref(),
+                                    info.site_name.as_deref(),
+                                )
+                                .await;
+                                embeds.push(info);
+                            }
+                        }
+                        if !embeds.is_empty() {
+                            let embed_event = ChatEvent::MessageEmbed {
+                                message_id: msg_id,
+                                server_id: server_id_owned,
+                                channel: channel_name_owned,
+                                embeds,
+                            };
+                            for sender in &member_senders {
+                                let _ = sender.send(embed_event.clone());
+                            }
+                        }
+                    });
+            }
         } else {
             // DM
             let target_session_id = self
@@ -747,7 +907,7 @@ impl ChatEngine {
         Ok(())
     }
 
-    /// Fetch message history for a channel.
+    /// Fetch message history for a channel, including edits, replies, and reactions.
     pub async fn fetch_history(
         &self,
         server_id: &str,
@@ -772,14 +932,106 @@ impl ChatEngine {
         .map_err(|e| format!("Failed to fetch history: {e}"))?;
 
         let has_more = rows.len() as i64 > limit;
+        let rows: Vec<_> = rows.into_iter().take(limit as usize).collect();
+
+        // Collect message IDs for batch reaction lookup
+        let msg_ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+
+        // Fetch reactions for all messages in batch
+        let reaction_rows =
+            crate::db::queries::messages::get_reactions_for_messages(pool, &msg_ids)
+                .await
+                .unwrap_or_default();
+
+        // Group reactions by message_id -> emoji -> user_ids
+        let mut reaction_map: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, Vec<String>>,
+        > = std::collections::HashMap::new();
+        for r in &reaction_rows {
+            reaction_map
+                .entry(r.message_id.clone())
+                .or_default()
+                .entry(r.emoji.clone())
+                .or_default()
+                .push(r.user_id.clone());
+        }
+
+        // Collect reply_to_ids for batch lookup
+        let reply_ids: Vec<String> = rows.iter().filter_map(|r| r.reply_to_id.clone()).collect();
+        let mut reply_map: std::collections::HashMap<String, ReplyInfo> =
+            std::collections::HashMap::new();
+        if !reply_ids.is_empty() {
+            for rid in &reply_ids {
+                if let Ok(Some(parent)) =
+                    crate::db::queries::messages::get_message_by_id(pool, rid).await
+                {
+                    reply_map.insert(
+                        parent.id.clone(),
+                        ReplyInfo {
+                            id: parent.id,
+                            from: parent.sender_nick,
+                            content_preview: parent.content.chars().take(100).collect(),
+                        },
+                    );
+                }
+            }
+        }
+
+        // Fetch attachments for all messages in batch
+        let attachment_rows =
+            crate::db::queries::attachments::get_attachments_for_messages(pool, &msg_ids)
+                .await
+                .unwrap_or_default();
+
+        // Group attachments by message_id
+        let mut attachment_map: std::collections::HashMap<String, Vec<super::events::AttachmentInfo>> =
+            std::collections::HashMap::new();
+        for a in &attachment_rows {
+            if let Some(ref mid) = a.message_id {
+                attachment_map.entry(mid.clone()).or_default().push(
+                    super::events::AttachmentInfo {
+                        id: a.id.clone(),
+                        filename: a.original_filename.clone(),
+                        content_type: a.content_type.clone(),
+                        file_size: a.file_size,
+                        url: format!("/api/uploads/{}", a.id),
+                    },
+                );
+            }
+        }
+
         let messages: Vec<HistoryMessage> = rows
             .into_iter()
-            .take(limit as usize)
-            .map(|row| HistoryMessage {
-                id: row.id.parse().unwrap_or_default(),
-                from: row.sender_nick,
-                content: row.content,
-                timestamp: row.created_at.parse().unwrap_or_else(|_| Utc::now()),
+            .map(|row| {
+                let reactions = reaction_map.get(&row.id).map(|emoji_map| {
+                    emoji_map
+                        .iter()
+                        .map(|(emoji, user_ids)| ReactionGroup {
+                            emoji: emoji.clone(),
+                            count: user_ids.len(),
+                            user_ids: user_ids.clone(),
+                        })
+                        .collect()
+                });
+                let reply_to = row
+                    .reply_to_id
+                    .as_ref()
+                    .and_then(|rid| reply_map.get(rid).cloned());
+                let edited_at = row.edited_at.as_ref().and_then(|s| s.parse().ok());
+                let attachments = attachment_map.remove(&row.id);
+
+                HistoryMessage {
+                    id: row.id.parse().unwrap_or_default(),
+                    from: row.sender_nick,
+                    content: row.content,
+                    timestamp: row.created_at.parse().unwrap_or_else(|_| Utc::now()),
+                    edited_at,
+                    reply_to,
+                    reactions,
+                    attachments,
+                    embeds: None,
+                }
             })
             .collect();
 
@@ -822,6 +1074,320 @@ impl ChatEngine {
                 self.sessions.get(sid).map(|s| MemberInfo {
                     nickname: s.nickname.clone(),
                     avatar_url: s.avatar_url.clone(),
+                })
+            })
+            .collect())
+    }
+
+    // ── Message editing & deletion ─────────────────────────────────
+
+    /// Edit a message's content. Only the sender or a moderator+ can edit.
+    pub async fn edit_message(
+        &self,
+        session_id: SessionId,
+        message_id: &str,
+        new_content: &str,
+    ) -> Result<(), String> {
+        validation::validate_message(new_content)?;
+
+        let session = self
+            .sessions
+            .get(&session_id)
+            .ok_or("Session not found")?
+            .clone();
+
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+
+        let msg = crate::db::queries::messages::get_message_by_id(pool, message_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?
+            .ok_or("Message not found")?;
+
+        // Only the sender can edit their own messages
+        let sender_id = session.user_id.as_deref().unwrap_or("");
+        if msg.sender_id != sender_id && msg.sender_nick != session.nickname {
+            return Err("You can only edit your own messages".into());
+        }
+
+        crate::db::queries::messages::update_message_content(pool, message_id, new_content)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+
+        let server_id = msg.server_id.ok_or("Message has no server")?;
+        let channel_id = msg.channel_id.ok_or("Message has no channel")?;
+
+        // Find the channel name for the event
+        let channel_name = self
+            .channels
+            .get(&channel_id)
+            .map(|ch| ch.name.clone())
+            .unwrap_or_default();
+
+        let event = ChatEvent::MessageEdit {
+            id: message_id.parse().unwrap_or_default(),
+            server_id: server_id.clone(),
+            channel: channel_name,
+            content: new_content.to_string(),
+            edited_at: Utc::now(),
+        };
+
+        // Broadcast to the channel (including sender)
+        self.broadcast_to_channel(&channel_id, &event, None);
+
+        Ok(())
+    }
+
+    /// Delete a message (soft delete). Sender can delete own, moderator+ can delete any.
+    pub async fn delete_message(
+        &self,
+        session_id: SessionId,
+        message_id: &str,
+    ) -> Result<(), String> {
+        let session = self
+            .sessions
+            .get(&session_id)
+            .ok_or("Session not found")?
+            .clone();
+
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+
+        let msg = crate::db::queries::messages::get_message_by_id(pool, message_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?
+            .ok_or("Message not found")?;
+
+        let sender_id = session.user_id.as_deref().unwrap_or("");
+        let is_sender = msg.sender_id == sender_id || msg.sender_nick == session.nickname;
+
+        if !is_sender {
+            // Check if user has moderator+ role
+            let server_id = msg.server_id.as_deref().ok_or("Message has no server")?;
+            if let Some(uid) = &session.user_id {
+                let role = self.get_server_role(server_id, uid).await;
+                if !matches!(
+                    role,
+                    Some(ServerRole::Owner) | Some(ServerRole::Admin) | Some(ServerRole::Moderator)
+                ) {
+                    return Err("You can only delete your own messages".into());
+                }
+            } else {
+                return Err("You can only delete your own messages".into());
+            }
+        }
+
+        crate::db::queries::messages::soft_delete_message(pool, message_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+
+        let server_id = msg.server_id.ok_or("Message has no server")?;
+        let channel_id = msg.channel_id.ok_or("Message has no channel")?;
+
+        let channel_name = self
+            .channels
+            .get(&channel_id)
+            .map(|ch| ch.name.clone())
+            .unwrap_or_default();
+
+        let event = ChatEvent::MessageDelete {
+            id: message_id.parse().unwrap_or_default(),
+            server_id,
+            channel: channel_name,
+        };
+
+        self.broadcast_to_channel(&channel_id, &event, None);
+
+        Ok(())
+    }
+
+    // ── Reactions ────────────────────────────────────────────────────
+
+    /// Add a reaction to a message.
+    pub async fn add_reaction(
+        &self,
+        session_id: SessionId,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<(), String> {
+        let session = self
+            .sessions
+            .get(&session_id)
+            .ok_or("Session not found")?
+            .clone();
+
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+
+        let msg = crate::db::queries::messages::get_message_by_id(pool, message_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?
+            .ok_or("Message not found")?;
+
+        let user_id = session.user_id.as_deref().unwrap_or(&session.nickname);
+
+        crate::db::queries::messages::add_reaction(pool, message_id, user_id, emoji)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+
+        let server_id = msg.server_id.ok_or("Message has no server")?;
+        let channel_id = msg.channel_id.ok_or("Message has no channel")?;
+
+        let channel_name = self
+            .channels
+            .get(&channel_id)
+            .map(|ch| ch.name.clone())
+            .unwrap_or_default();
+
+        let event = ChatEvent::ReactionAdd {
+            message_id: message_id.parse().unwrap_or_default(),
+            server_id,
+            channel: channel_name,
+            user_id: user_id.to_string(),
+            nickname: session.nickname.clone(),
+            emoji: emoji.to_string(),
+        };
+
+        self.broadcast_to_channel(&channel_id, &event, None);
+
+        Ok(())
+    }
+
+    /// Remove a reaction from a message.
+    pub async fn remove_reaction(
+        &self,
+        session_id: SessionId,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<(), String> {
+        let session = self
+            .sessions
+            .get(&session_id)
+            .ok_or("Session not found")?
+            .clone();
+
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+
+        let msg = crate::db::queries::messages::get_message_by_id(pool, message_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?
+            .ok_or("Message not found")?;
+
+        let user_id = session.user_id.as_deref().unwrap_or(&session.nickname);
+
+        crate::db::queries::messages::remove_reaction(pool, message_id, user_id, emoji)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+
+        let server_id = msg.server_id.ok_or("Message has no server")?;
+        let channel_id = msg.channel_id.ok_or("Message has no channel")?;
+
+        let channel_name = self
+            .channels
+            .get(&channel_id)
+            .map(|ch| ch.name.clone())
+            .unwrap_or_default();
+
+        let event = ChatEvent::ReactionRemove {
+            message_id: message_id.parse().unwrap_or_default(),
+            server_id,
+            channel: channel_name,
+            user_id: user_id.to_string(),
+            nickname: session.nickname.clone(),
+            emoji: emoji.to_string(),
+        };
+
+        self.broadcast_to_channel(&channel_id, &event, None);
+
+        Ok(())
+    }
+
+    // ── Typing indicators ────────────────────────────────────────────
+
+    /// Broadcast a typing indicator to a channel.
+    pub fn send_typing(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        channel_name: &str,
+    ) -> Result<(), String> {
+        let channel_name = normalize_channel_name(channel_name);
+
+        let session = self
+            .sessions
+            .get(&session_id)
+            .ok_or("Session not found")?
+            .clone();
+
+        let channel_id = self.resolve_channel_id(server_id, &channel_name)?;
+
+        let event = ChatEvent::TypingStart {
+            server_id: server_id.to_string(),
+            channel: channel_name,
+            nickname: session.nickname.clone(),
+        };
+
+        self.broadcast_to_channel(&channel_id, &event, Some(session_id));
+
+        Ok(())
+    }
+
+    // ── Read state ────────────────────────────────────────────────────
+
+    /// Mark a channel as read for a user, up to a specific message ID.
+    pub async fn mark_read(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        channel_name: &str,
+        message_id: &str,
+    ) -> Result<(), String> {
+        let session = self
+            .sessions
+            .get(&session_id)
+            .ok_or("Session not found")?
+            .clone();
+
+        let user_id = session.user_id.as_deref().ok_or("AUTH_REQUIRED")?;
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+
+        let channel_name = normalize_channel_name(channel_name);
+        let channel_id = self.resolve_channel_id(server_id, &channel_name)?;
+
+        crate::db::queries::messages::mark_channel_read(pool, user_id, &channel_id, message_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+
+        Ok(())
+    }
+
+    /// Get unread counts for all channels in a server for a user.
+    pub async fn get_unread_counts(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+    ) -> Result<Vec<super::events::UnreadCount>, String> {
+        let session = self
+            .sessions
+            .get(&session_id)
+            .ok_or("Session not found")?
+            .clone();
+
+        let user_id = session.user_id.as_deref().ok_or("AUTH_REQUIRED")?;
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+
+        let rows = crate::db::queries::messages::get_unread_counts(pool, user_id, server_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+
+        // Map channel_id -> channel_name
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let name = self
+                    .channels
+                    .get(&r.channel_id)
+                    .map(|ch| ch.name.clone())?;
+                Some(super::events::UnreadCount {
+                    channel_name: name,
+                    count: r.unread_count,
                 })
             })
             .collect())
@@ -964,7 +1530,14 @@ mod tests {
         while rx2.try_recv().is_ok() {}
 
         engine
-            .send_message(sid1, DEFAULT_SERVER_ID, "#general", "Hello from Alice!")
+            .send_message(
+                sid1,
+                DEFAULT_SERVER_ID,
+                "#general",
+                "Hello from Alice!",
+                None,
+                None,
+            )
             .unwrap();
 
         let event = rx2.try_recv().unwrap();
@@ -1052,7 +1625,7 @@ mod tests {
             .unwrap();
 
         engine
-            .send_message(sid1, DEFAULT_SERVER_ID, "bob", "Hey Bob!")
+            .send_message(sid1, DEFAULT_SERVER_ID, "bob", "Hey Bob!", None, None)
             .unwrap();
 
         let event = rx2.try_recv().unwrap();
@@ -1134,7 +1707,7 @@ mod tests {
         engine.join_channel(sid2, &server_b, "#general").unwrap();
 
         // Alice is not in server_b's #general — should fail
-        let result = engine.send_message(sid, &server_b, "#general", "Hello");
+        let result = engine.send_message(sid, &server_b, "#general", "Hello", None, None);
         assert!(result.is_err());
     }
 }

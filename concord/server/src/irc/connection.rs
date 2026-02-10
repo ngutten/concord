@@ -380,10 +380,58 @@ fn event_to_irc_lines(engine: &ChatEngine, my_nick: &str, event: &ChatEvent) -> 
                 message
             )]
         }
+        // Message edit: send a NOTICE indicating the edit
+        ChatEvent::MessageEdit {
+            server_id, channel, ..
+        } => {
+            let irc_channel = to_irc_channel(engine, server_id, channel);
+            vec![format!(
+                ":{} NOTICE {} :* A message was edited in {}",
+                formatter::server_name(),
+                my_nick,
+                irc_channel
+            )]
+        }
+        // Message delete: send a NOTICE indicating the deletion
+        ChatEvent::MessageDelete {
+            server_id, channel, ..
+        } => {
+            let irc_channel = to_irc_channel(engine, server_id, channel);
+            vec![format!(
+                ":{} NOTICE {} :* A message was deleted in {}",
+                formatter::server_name(),
+                my_nick,
+                irc_channel
+            )]
+        }
+        // Reactions: send a NOTICE with the reaction info
+        ChatEvent::ReactionAdd {
+            server_id,
+            channel,
+            nickname,
+            emoji,
+            ..
+        } => {
+            let irc_channel = to_irc_channel(engine, server_id, channel);
+            vec![format!(
+                ":{} NOTICE {} :* {} reacted with {} in {}",
+                formatter::server_name(),
+                my_nick,
+                nickname,
+                emoji,
+                irc_channel
+            )]
+        }
+        ChatEvent::ReactionRemove { .. } => vec![],
+        // Typing indicators are not sent to IRC
+        ChatEvent::TypingStart { .. } => vec![],
+        // Embeds are WebSocket-only (rich previews don't map to IRC)
+        ChatEvent::MessageEmbed { .. } => vec![],
         // These events are WebSocket-specific and don't map to IRC
         ChatEvent::ChannelList { .. }
         | ChatEvent::History { .. }
-        | ChatEvent::ServerList { .. } => vec![],
+        | ChatEvent::ServerList { .. }
+        | ChatEvent::UnreadCounts { .. } => vec![],
     }
 }
 

@@ -31,6 +31,9 @@ pub struct MessageRow {
     pub content: String,
     pub created_at: String,
     pub target_user_id: Option<String>,
+    pub edited_at: Option<String>,
+    pub deleted_at: Option<String>,
+    pub reply_to_id: Option<String>,
 }
 
 /// A stored channel from the database.

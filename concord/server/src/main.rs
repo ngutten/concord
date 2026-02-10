@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
@@ -59,14 +60,23 @@ async fn main() {
         start_irc_listener(&irc_addr, irc_engine, irc_pool, irc_cancel).await;
     });
 
+    // Ensure upload directory exists
+    let upload_dir = PathBuf::from(&config.storage.upload_dir);
+    tokio::fs::create_dir_all(&upload_dir)
+        .await
+        .expect("failed to create upload directory");
+    let max_file_size = config.storage.max_file_size_mb * 1024 * 1024;
+
     // Build shared app state for the web server
     let auth_config = config.to_auth_config();
-    let atproto = AtprotoOAuth::new();
+    let atproto = AtprotoOAuth::load_or_create(&pool).await;
     let app_state = Arc::new(AppState {
         engine,
         db: pool,
         auth_config,
         atproto,
+        upload_dir,
+        max_file_size,
     });
 
     let app = build_router(app_state);

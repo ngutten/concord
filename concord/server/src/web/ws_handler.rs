@@ -33,6 +33,8 @@ enum ClientMessage {
         server_id: String,
         channel: String,
         content: String,
+        reply_to: Option<String>,
+        attachment_ids: Option<Vec<String>>,
     },
     JoinChannel {
         #[serde(default = "default_server_id")]
@@ -93,6 +95,36 @@ enum ClientMessage {
         server_id: String,
         user_id: String,
         role: String,
+    },
+    EditMessage {
+        message_id: String,
+        content: String,
+    },
+    DeleteMessage {
+        message_id: String,
+    },
+    AddReaction {
+        message_id: String,
+        emoji: String,
+    },
+    RemoveReaction {
+        message_id: String,
+        emoji: String,
+    },
+    Typing {
+        #[serde(default = "default_server_id")]
+        server_id: String,
+        channel: String,
+    },
+    MarkRead {
+        #[serde(default = "default_server_id")]
+        server_id: String,
+        channel: String,
+        message_id: String,
+    },
+    GetUnreadCounts {
+        #[serde(default = "default_server_id")]
+        server_id: String,
     },
 }
 
@@ -231,7 +263,16 @@ async fn handle_client_message(
             server_id,
             channel,
             content,
-        } => engine.send_message(session_id, &server_id, &channel, &content),
+            reply_to,
+            attachment_ids,
+        } => engine.send_message(
+            session_id,
+            &server_id,
+            &channel,
+            &content,
+            reply_to.as_deref(),
+            attachment_ids.as_deref(),
+        ),
         ClientMessage::JoinChannel { server_id, channel } => {
             engine.join_channel(session_id, &server_id, &channel)
         }
@@ -451,6 +492,47 @@ async fn handle_client_message(
                     .map_err(|e| format!("Failed to update role: {e}"))
             } else {
                 Err("No database configured".into())
+            }
+        }
+        ClientMessage::EditMessage {
+            message_id,
+            content,
+        } => engine.edit_message(session_id, &message_id, &content).await,
+        ClientMessage::DeleteMessage { message_id } => {
+            engine.delete_message(session_id, &message_id).await
+        }
+        ClientMessage::AddReaction { message_id, emoji } => {
+            engine.add_reaction(session_id, &message_id, &emoji).await
+        }
+        ClientMessage::RemoveReaction { message_id, emoji } => {
+            engine
+                .remove_reaction(session_id, &message_id, &emoji)
+                .await
+        }
+        ClientMessage::Typing { server_id, channel } => {
+            engine.send_typing(session_id, &server_id, &channel)
+        }
+        ClientMessage::MarkRead {
+            server_id,
+            channel,
+            message_id,
+        } => {
+            engine
+                .mark_read(session_id, &server_id, &channel, &message_id)
+                .await
+        }
+        ClientMessage::GetUnreadCounts { server_id } => {
+            match engine.get_unread_counts(session_id, &server_id).await {
+                Ok(counts) => {
+                    if let Some(session) = engine.get_session(session_id) {
+                        let _ = session.send(ChatEvent::UnreadCounts {
+                            server_id,
+                            counts,
+                        });
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e),
             }
         }
     };

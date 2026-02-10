@@ -38,18 +38,42 @@ pub struct PendingAtprotoAuth {
     pub dpop_key: KeyData,
     pub handle: String,
     pub auth_server: AuthorizationServer,
-}
-
-impl Default for AtprotoOAuth {
-    fn default() -> Self {
-        Self::new()
-    }
+    pub pds_url: String,
 }
 
 impl AtprotoOAuth {
-    pub fn new() -> Self {
-        let signing_key =
-            generate_key(KeyType::P256Private).expect("failed to generate atproto signing key");
+    /// Load the signing key from the database, or generate and persist a new one.
+    pub async fn load_or_create(pool: &sqlx::SqlitePool) -> Self {
+        const KEY_NAME: &str = "atproto_signing_key";
+
+        // Try to load existing key from server_config
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM server_config WHERE key = ?",
+        )
+        .bind(KEY_NAME)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+
+        let signing_key = if let Some(ref jwk_json) = existing {
+            if let Ok(wrapped) = serde_json::from_str::<jwk::WrappedJsonWebKey>(jwk_json) {
+                if let Ok(key) = jwk::to_key_data(&wrapped) {
+                    info!("loaded persisted AT Protocol signing key");
+                    key
+                } else {
+                    warn!("stored signing key is invalid, generating new one");
+                    Self::generate_and_store(pool, KEY_NAME).await
+                }
+            } else {
+                warn!("stored signing key JSON is malformed, generating new one");
+                Self::generate_and_store(pool, KEY_NAME).await
+            }
+        } else {
+            info!("no persisted AT Protocol signing key found, generating new one");
+            Self::generate_and_store(pool, KEY_NAME).await
+        };
+
         let public_key =
             to_public(&signing_key).expect("failed to derive public key from signing key");
         let public_jwk =
@@ -60,12 +84,31 @@ impl AtprotoOAuth {
             pending: Mutex::new(HashMap::new()),
         }
     }
+
+    async fn generate_and_store(pool: &sqlx::SqlitePool, key_name: &str) -> KeyData {
+        let signing_key =
+            generate_key(KeyType::P256Private).expect("failed to generate atproto signing key");
+        let wrapped = jwk::generate(&signing_key).expect("failed to generate JWK for signing key");
+        let jwk_json = serde_json::to_string(&wrapped).expect("failed to serialize signing key");
+
+        let _ = sqlx::query(
+            "INSERT INTO server_config (key, value) VALUES (?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')",
+        )
+        .bind(key_name)
+        .bind(&jwk_json)
+        .execute(pool)
+        .await
+        .map_err(|e| warn!(error = %e, "failed to persist signing key to database"));
+
+        signing_key
+    }
 }
 
 /// GET /api/auth/atproto/client-metadata.json — serves OAuth client metadata document.
 pub async fn client_metadata(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let public_url = &state.auth_config.public_url;
-    let client_id = format!("{}/api/auth/atproto/client-metadata.json", public_url);
+    let client_id = format!("{}/api/auth/atproto/v2/client-metadata.json", public_url);
 
     let public_jwk_value =
         serde_json::to_value(&state.atproto.public_jwk).expect("failed to serialize public JWK");
@@ -79,7 +122,7 @@ pub async fn client_metadata(State(state): State<Arc<AppState>>) -> impl IntoRes
         "grant_types": ["authorization_code", "refresh_token"],
         "redirect_uris": [format!("{}/api/auth/atproto/callback", public_url)],
         "response_types": ["code"],
-        "scope": "atproto",
+        "scope": "atproto transition:generic",
         "token_endpoint_auth_method": "private_key_jwt",
         "token_endpoint_auth_signing_alg": "ES256",
         "jwks": {
@@ -106,7 +149,7 @@ pub async fn atproto_login(
     }
 
     let public_url = &state.auth_config.public_url;
-    let client_id = format!("{}/api/auth/atproto/client-metadata.json", public_url);
+    let client_id = format!("{}/api/auth/atproto/v2/client-metadata.json", public_url);
     let redirect_uri = format!("{}/api/auth/atproto/callback", public_url);
 
     let http_client = reqwest::Client::new();
@@ -153,7 +196,7 @@ pub async fn atproto_login(
         state: oauth_state.clone(),
         nonce: nonce.clone(),
         code_challenge,
-        scope: "atproto".to_string(),
+        scope: "atproto transition:generic".to_string(),
     };
 
     // Make Pushed Authorization Request (PAR)
@@ -215,6 +258,7 @@ pub async fn atproto_login(
                 dpop_key,
                 handle: handle.clone(),
                 auth_server: auth_server.clone(),
+                pds_url: pds_url.clone(),
             },
         );
     }
@@ -268,7 +312,7 @@ pub async fn atproto_callback(
 
     let oauth_client = OAuthClient {
         redirect_uri: format!("{}/api/auth/atproto/callback", public_url),
-        client_id: format!("{}/api/auth/atproto/client-metadata.json", public_url),
+        client_id: format!("{}/api/auth/atproto/v2/client-metadata.json", public_url),
         private_signing_key_data: state.atproto.signing_key.clone(),
     };
 
@@ -289,6 +333,13 @@ pub async fn atproto_callback(
             return (StatusCode::BAD_GATEWAY, "Token exchange failed").into_response();
         }
     };
+
+    info!(
+        scope = %token_response.scope,
+        token_type = %token_response.token_type,
+        expires_in = token_response.expires_in,
+        "AT Protocol token exchange complete"
+    );
 
     // The DID is in token_response.sub
     let did = match &token_response.sub {
@@ -342,6 +393,31 @@ pub async fn atproto_callback(
             return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
         }
     };
+
+    // Store AT Protocol credentials for PDS API access (blob uploads, etc.)
+    // Serialize the DPoP private key as JWK JSON to preserve the private key material.
+    let dpop_key_str = match jwk::generate(&pending.dpop_key) {
+        Ok(wrapped) => serde_json::to_string(&wrapped).unwrap_or_default(),
+        Err(e) => {
+            warn!(error = %e, "Failed to serialize DPoP key as JWK");
+            String::new()
+        }
+    };
+    let expires_at = (Utc::now() + chrono::Duration::seconds(token_response.expires_in as i64))
+        .to_rfc3339();
+    if let Err(e) = users::store_atproto_credentials(
+        &state.db,
+        &user_id,
+        &token_response.access_token,
+        token_response.refresh_token.as_deref().unwrap_or(""),
+        &dpop_key_str,
+        &pending.pds_url,
+        &expires_at,
+    )
+    .await
+    {
+        warn!(error = %e, "Failed to store AT Protocol credentials (non-fatal)");
+    }
 
     // Issue session cookie and redirect
     issue_session_cookie(&state.auth_config, &user_id)
