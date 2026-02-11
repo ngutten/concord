@@ -114,6 +114,11 @@ function MessageItem({ message }: { message: HistoryMessage }) {
   const deleteMessage = useChatStore((s) => s.deleteMessage);
   const addReaction = useChatStore((s) => s.addReaction);
   const setReplyingTo = useChatStore((s) => s.setReplyingTo);
+  const pinMessage = useChatStore((s) => s.pinMessage);
+  const addBookmark = useChatStore((s) => s.addBookmark);
+  const createThread = useChatStore((s) => s.createThread);
+  const activeServer = useUiStore((s) => s.activeServer);
+  const activeChannel = useUiStore((s) => s.activeChannel);
   const avatarUrl = avatars[message.from];
   const time = new Date(message.timestamp);
   const timeStr = time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -159,6 +164,26 @@ function MessageItem({ message }: { message: HistoryMessage }) {
 
   const handleQuickReact = (emoji: string) => {
     addReaction(message.id, emoji);
+    setShowActions(false);
+  };
+
+  const handlePin = () => {
+    if (activeServer && activeChannel) {
+      pinMessage(activeServer, activeChannel, message.id);
+    }
+    setShowActions(false);
+  };
+
+  const handleBookmark = () => {
+    addBookmark(message.id);
+    setShowActions(false);
+  };
+
+  const handleCreateThread = () => {
+    if (activeServer && activeChannel) {
+      const threadName = `thread-${message.id.slice(0, 8)}`;
+      createThread(activeServer, activeChannel, threadName, message.id);
+    }
     setShowActions(false);
   };
 
@@ -272,6 +297,33 @@ function MessageItem({ message }: { message: HistoryMessage }) {
           >
             <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M3 10h10a5 5 0 015 5v3M3 10l4-4M3 10l4 4" />
+            </svg>
+          </button>
+          <button
+            onClick={handleCreateThread}
+            className="px-1.5 py-0.5 text-sm text-text-muted hover:bg-bg-hover hover:text-text-primary"
+            title="Create Thread"
+          >
+            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M7 8h10M7 12h4m1 8l-4-4H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-3l-4 4z" />
+            </svg>
+          </button>
+          <button
+            onClick={handlePin}
+            className="px-1.5 py-0.5 text-sm text-text-muted hover:bg-bg-hover hover:text-text-primary"
+            title="Pin Message"
+          >
+            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 5.25v13.5m-7.5-13.5v13.5" />
+            </svg>
+          </button>
+          <button
+            onClick={handleBookmark}
+            className="px-1.5 py-0.5 text-sm text-text-muted hover:bg-bg-hover hover:text-text-primary"
+            title="Bookmark"
+          >
+            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z" />
             </svg>
           </button>
           {isOwn && (

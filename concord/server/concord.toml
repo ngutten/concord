@@ -1,0 +1,5 @@
+[auth]
+public_url = ""
+
+[admin]
+admin_users = [""]

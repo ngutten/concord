@@ -1,4 +1,155 @@
-/// Server-level roles ordered by privilege level.
+use bitflags::bitflags;
+
+bitflags! {
+    /// Permission bitfield for roles and channel overrides.
+    /// Stored as `i64` in SQLite (cast to/from `u64`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct Permissions: u64 {
+        // ── General ──
+        const VIEW_CHANNELS         = 1 << 0;
+        const MANAGE_CHANNELS       = 1 << 1;
+        const MANAGE_ROLES          = 1 << 2;
+        const MANAGE_SERVER         = 1 << 3;
+        const CREATE_INVITES        = 1 << 4;
+        const KICK_MEMBERS          = 1 << 5;
+        const BAN_MEMBERS           = 1 << 6;
+        const ADMINISTRATOR         = 1 << 7;
+
+        // ── Channel text ──
+        const SEND_MESSAGES         = 1 << 10;
+        const EMBED_LINKS           = 1 << 11;
+        const ATTACH_FILES          = 1 << 12;
+        const ADD_REACTIONS         = 1 << 13;
+        const MENTION_EVERYONE      = 1 << 14;
+        const MANAGE_MESSAGES       = 1 << 15;
+        const READ_MESSAGE_HISTORY  = 1 << 16;
+
+        // ── Voice (future) ──
+        const CONNECT               = 1 << 20;
+        const SPEAK                 = 1 << 21;
+        const MUTE_MEMBERS          = 1 << 22;
+        const DEAFEN_MEMBERS        = 1 << 23;
+        const MOVE_MEMBERS          = 1 << 24;
+    }
+}
+
+/// Default permissions for the @everyone role.
+pub const DEFAULT_EVERYONE: Permissions = Permissions::VIEW_CHANNELS
+    .union(Permissions::SEND_MESSAGES)
+    .union(Permissions::EMBED_LINKS)
+    .union(Permissions::ATTACH_FILES)
+    .union(Permissions::ADD_REACTIONS)
+    .union(Permissions::READ_MESSAGE_HISTORY)
+    .union(Permissions::CREATE_INVITES);
+
+/// Default permissions for a Moderator role.
+pub const DEFAULT_MODERATOR: Permissions = DEFAULT_EVERYONE
+    .union(Permissions::KICK_MEMBERS)
+    .union(Permissions::MANAGE_MESSAGES)
+    .union(Permissions::MENTION_EVERYONE);
+
+/// Default permissions for an Admin role.
+pub const DEFAULT_ADMIN: Permissions = DEFAULT_MODERATOR
+    .union(Permissions::MANAGE_CHANNELS)
+    .union(Permissions::MANAGE_ROLES)
+    .union(Permissions::MANAGE_SERVER)
+    .union(Permissions::BAN_MEMBERS);
+
+/// A channel permission override (allow/deny pair).
+#[derive(Debug, Clone)]
+pub struct ChannelOverride {
+    pub target_type: OverrideTargetType,
+    pub target_id: String,
+    pub allow: Permissions,
+    pub deny: Permissions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverrideTargetType {
+    Role,
+    User,
+}
+
+/// Compute a user's effective permissions in a channel.
+///
+/// Algorithm (mirrors Discord):
+///   1. Server owner gets all permissions unconditionally.
+///   2. Start with `@everyone` role's base permissions.
+///   3. OR in all the user's assigned role permissions.
+///   4. If ADMINISTRATOR is set, return all permissions.
+///   5. Apply channel overrides for `@everyone` role (allow OR, deny AND NOT).
+///   6. For each of the user's roles, collect allow/deny from overrides.
+///   7. OR all role allows, AND NOT all role denies.
+///   8. Apply user-specific override (allow OR, deny AND NOT).
+pub fn compute_effective_permissions(
+    base_everyone: Permissions,
+    user_role_permissions: &[(String, Permissions)],
+    channel_overrides: &[ChannelOverride],
+    everyone_role_id: &str,
+    user_id: &str,
+    is_owner: bool,
+) -> Permissions {
+    if is_owner {
+        return Permissions::all();
+    }
+
+    // Step 1-2: base = @everyone perms | all user role perms
+    let mut perms = base_everyone;
+    for (_role_id, role_perms) in user_role_permissions {
+        perms |= *role_perms;
+    }
+
+    // Step 3: admin bypass
+    if perms.contains(Permissions::ADMINISTRATOR) {
+        return Permissions::all();
+    }
+
+    // If no channel overrides, we're done (server-level permissions)
+    if channel_overrides.is_empty() {
+        return perms;
+    }
+
+    // Step 4: apply @everyone channel override
+    for ov in channel_overrides {
+        if ov.target_type == OverrideTargetType::Role && ov.target_id == everyone_role_id {
+            perms |= ov.allow;
+            perms &= !ov.deny;
+        }
+    }
+
+    // Step 5-6: collect role allows/denies
+    let user_role_ids: Vec<&str> = user_role_permissions
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let mut role_allow = Permissions::empty();
+    let mut role_deny = Permissions::empty();
+    for ov in channel_overrides {
+        if ov.target_type == OverrideTargetType::Role
+            && ov.target_id != everyone_role_id
+            && user_role_ids.contains(&ov.target_id.as_str())
+        {
+            role_allow |= ov.allow;
+            role_deny |= ov.deny;
+        }
+    }
+    perms |= role_allow;
+    perms &= !role_deny;
+
+    // Step 7: apply user-specific override
+    for ov in channel_overrides {
+        if ov.target_type == OverrideTargetType::User && ov.target_id == user_id {
+            perms |= ov.allow;
+            perms &= !ov.deny;
+        }
+    }
+
+    perms
+}
+
+// ── Legacy role compat ──────────────────────────────────────
+
+/// Server-level roles ordered by privilege level (legacy, kept for backward compat).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ServerRole {
     Member,
@@ -23,6 +174,16 @@ impl ServerRole {
             Self::Admin => "admin",
             Self::Moderator => "moderator",
             Self::Member => "member",
+        }
+    }
+
+    /// Map this legacy role to a default permission bitfield.
+    pub fn to_default_permissions(&self) -> Permissions {
+        match self {
+            Self::Member => DEFAULT_EVERYONE,
+            Self::Moderator => DEFAULT_MODERATOR,
+            Self::Admin => DEFAULT_ADMIN,
+            Self::Owner => Permissions::all(),
         }
     }
 
@@ -86,5 +247,171 @@ mod tests {
 
         assert!(ServerRole::Admin.can_manage_roles(&ServerRole::Moderator));
         assert!(!ServerRole::Moderator.can_manage_roles(&ServerRole::Admin));
+    }
+
+    #[test]
+    fn test_bitfield_operations() {
+        let perms = Permissions::VIEW_CHANNELS | Permissions::SEND_MESSAGES;
+        assert!(perms.contains(Permissions::VIEW_CHANNELS));
+        assert!(perms.contains(Permissions::SEND_MESSAGES));
+        assert!(!perms.contains(Permissions::MANAGE_CHANNELS));
+
+        let combined = perms | Permissions::MANAGE_CHANNELS;
+        assert!(combined.contains(Permissions::MANAGE_CHANNELS));
+
+        let denied = combined & !Permissions::SEND_MESSAGES;
+        assert!(!denied.contains(Permissions::SEND_MESSAGES));
+        assert!(denied.contains(Permissions::VIEW_CHANNELS));
+    }
+
+    #[test]
+    fn test_default_permissions() {
+        assert!(DEFAULT_EVERYONE.contains(Permissions::VIEW_CHANNELS));
+        assert!(DEFAULT_EVERYONE.contains(Permissions::SEND_MESSAGES));
+        assert!(!DEFAULT_EVERYONE.contains(Permissions::MANAGE_CHANNELS));
+        assert!(!DEFAULT_EVERYONE.contains(Permissions::ADMINISTRATOR));
+
+        assert!(DEFAULT_MODERATOR.contains(Permissions::KICK_MEMBERS));
+        assert!(DEFAULT_MODERATOR.contains(Permissions::MANAGE_MESSAGES));
+        assert!(!DEFAULT_MODERATOR.contains(Permissions::MANAGE_CHANNELS));
+
+        assert!(DEFAULT_ADMIN.contains(Permissions::MANAGE_CHANNELS));
+        assert!(DEFAULT_ADMIN.contains(Permissions::MANAGE_ROLES));
+        assert!(!DEFAULT_ADMIN.contains(Permissions::ADMINISTRATOR));
+    }
+
+    #[test]
+    fn test_legacy_role_to_permissions() {
+        assert_eq!(ServerRole::Member.to_default_permissions(), DEFAULT_EVERYONE);
+        assert_eq!(ServerRole::Moderator.to_default_permissions(), DEFAULT_MODERATOR);
+        assert_eq!(ServerRole::Admin.to_default_permissions(), DEFAULT_ADMIN);
+        assert_eq!(ServerRole::Owner.to_default_permissions(), Permissions::all());
+    }
+
+    #[test]
+    fn test_effective_permissions_basic() {
+        // User with only @everyone role
+        let perms = compute_effective_permissions(
+            DEFAULT_EVERYONE,
+            &[],
+            &[],
+            "everyone-role-id",
+            "user1",
+            false,
+        );
+        assert!(perms.contains(Permissions::VIEW_CHANNELS));
+        assert!(perms.contains(Permissions::SEND_MESSAGES));
+        assert!(!perms.contains(Permissions::MANAGE_CHANNELS));
+    }
+
+    #[test]
+    fn test_effective_permissions_multi_role() {
+        let perms = compute_effective_permissions(
+            DEFAULT_EVERYONE,
+            &[
+                ("mod-role".to_string(), DEFAULT_MODERATOR),
+            ],
+            &[],
+            "everyone-role-id",
+            "user1",
+            false,
+        );
+        assert!(perms.contains(Permissions::KICK_MEMBERS));
+        assert!(perms.contains(Permissions::MANAGE_MESSAGES));
+        assert!(!perms.contains(Permissions::MANAGE_CHANNELS));
+    }
+
+    #[test]
+    fn test_effective_permissions_admin_bypass() {
+        let perms = compute_effective_permissions(
+            DEFAULT_EVERYONE,
+            &[
+                ("admin-role".to_string(), Permissions::ADMINISTRATOR),
+            ],
+            &[
+                ChannelOverride {
+                    target_type: OverrideTargetType::User,
+                    target_id: "user1".to_string(),
+                    allow: Permissions::empty(),
+                    deny: Permissions::SEND_MESSAGES,
+                },
+            ],
+            "everyone-role-id",
+            "user1",
+            false,
+        );
+        // ADMINISTRATOR bypasses all — even explicit denies are ignored
+        assert!(perms.contains(Permissions::SEND_MESSAGES));
+        assert_eq!(perms, Permissions::all());
+    }
+
+    #[test]
+    fn test_effective_permissions_owner_bypass() {
+        let perms = compute_effective_permissions(
+            Permissions::empty(),
+            &[],
+            &[
+                ChannelOverride {
+                    target_type: OverrideTargetType::User,
+                    target_id: "owner1".to_string(),
+                    allow: Permissions::empty(),
+                    deny: Permissions::all(),
+                },
+            ],
+            "everyone-role-id",
+            "owner1",
+            true, // is_owner
+        );
+        assert_eq!(perms, Permissions::all());
+    }
+
+    #[test]
+    fn test_effective_permissions_channel_override_deny() {
+        let perms = compute_effective_permissions(
+            DEFAULT_EVERYONE,
+            &[],
+            &[
+                // Deny SEND_MESSAGES for @everyone in this channel
+                ChannelOverride {
+                    target_type: OverrideTargetType::Role,
+                    target_id: "everyone-role-id".to_string(),
+                    allow: Permissions::empty(),
+                    deny: Permissions::SEND_MESSAGES,
+                },
+            ],
+            "everyone-role-id",
+            "user1",
+            false,
+        );
+        assert!(perms.contains(Permissions::VIEW_CHANNELS));
+        assert!(!perms.contains(Permissions::SEND_MESSAGES));
+    }
+
+    #[test]
+    fn test_effective_permissions_user_override() {
+        let perms = compute_effective_permissions(
+            DEFAULT_EVERYONE,
+            &[],
+            &[
+                // Deny everyone from sending
+                ChannelOverride {
+                    target_type: OverrideTargetType::Role,
+                    target_id: "everyone-role-id".to_string(),
+                    allow: Permissions::empty(),
+                    deny: Permissions::SEND_MESSAGES,
+                },
+                // But allow this specific user
+                ChannelOverride {
+                    target_type: OverrideTargetType::User,
+                    target_id: "special-user".to_string(),
+                    allow: Permissions::SEND_MESSAGES,
+                    deny: Permissions::empty(),
+                },
+            ],
+            "everyone-role-id",
+            "special-user",
+            false,
+        );
+        assert!(perms.contains(Permissions::SEND_MESSAGES));
     }
 }

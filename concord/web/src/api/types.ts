@@ -27,11 +27,23 @@ export interface ChannelInfo {
   name: string;
   topic: string;
   member_count: number;
+  category_id?: string | null;
+  position: number;
+  is_private: boolean;
+  channel_type: string;
+  thread_parent_message_id?: string | null;
+  archived: boolean;
+  slowmode_seconds: number;
+  is_nsfw: boolean;
 }
 
 export interface MemberInfo {
   nickname: string;
   avatar_url?: string | null;
+  status?: string | null;
+  custom_status?: string | null;
+  status_emoji?: string | null;
+  user_id?: string | null;
 }
 
 export interface ReplyInfo {
@@ -77,6 +89,222 @@ export interface HistoryMessage {
 export interface UnreadCount {
   channel_name: string;
   count: number;
+}
+
+export interface RoleInfo {
+  id: string;
+  server_id: string;
+  name: string;
+  color?: string | null;
+  icon_url?: string | null;
+  position: number;
+  permissions: number;
+  is_default: boolean;
+}
+
+export interface CategoryInfo {
+  id: string;
+  server_id: string;
+  name: string;
+  position: number;
+}
+
+export interface ChannelPositionInfo {
+  id: string;
+  category_id?: string | null;
+  position: number;
+}
+
+export interface PresenceInfo {
+  user_id: string;
+  nickname: string;
+  avatar_url?: string | null;
+  status: string; // 'online' | 'idle' | 'dnd' | 'offline'
+  custom_status?: string | null;
+  status_emoji?: string | null;
+}
+
+export interface UserProfileInfo {
+  user_id: string;
+  username: string;
+  avatar_url?: string | null;
+  bio?: string | null;
+  pronouns?: string | null;
+  banner_url?: string | null;
+  created_at: string;
+}
+
+export interface NotificationSettingInfo {
+  id: string;
+  server_id?: string | null;
+  channel_id?: string | null;
+  level: string; // 'all' | 'mentions' | 'none' | 'default'
+  suppress_everyone: boolean;
+  suppress_roles: boolean;
+  muted: boolean;
+  mute_until?: string | null;
+}
+
+export interface SearchResultMessage {
+  id: string;
+  from: string;
+  content: string;
+  timestamp: string;
+  channel_id: string;
+  channel_name: string;
+  edited_at?: string | null;
+}
+
+export interface PinnedMessageInfo {
+  id: string;
+  message_id: string;
+  channel_id: string;
+  pinned_by: string;
+  pinned_at: string;
+  from: string;
+  content: string;
+  timestamp: string;
+}
+
+export interface ThreadInfo {
+  id: string;
+  name: string;
+  channel_type: string; // 'public_thread' | 'private_thread'
+  parent_message_id?: string | null;
+  archived: boolean;
+  auto_archive_minutes: number;
+  message_count: number;
+  created_at: string;
+}
+
+export interface ForumTagInfo {
+  id: string;
+  name: string;
+  emoji?: string | null;
+  moderated: boolean;
+  position: number;
+}
+
+export interface BookmarkInfo {
+  id: string;
+  message_id: string;
+  channel_id: string;
+  from: string;
+  content: string;
+  timestamp: string;
+  note?: string | null;
+  created_at: string;
+}
+
+export interface AuditLogEntry {
+  id: string;
+  actor_id: string;
+  action_type: string;
+  target_type?: string | null;
+  target_id?: string | null;
+  reason?: string | null;
+  changes?: string | null;
+  created_at: string;
+}
+
+export interface BanInfo {
+  id: string;
+  user_id: string;
+  banned_by: string;
+  reason?: string | null;
+  created_at: string;
+}
+
+export interface AutomodRuleInfo {
+  id: string;
+  name: string;
+  enabled: boolean;
+  rule_type: string; // 'keyword' | 'mention_spam' | 'link_filter'
+  config: string; // JSON string
+  action_type: string; // 'delete' | 'timeout' | 'flag'
+  timeout_duration_seconds?: number | null;
+}
+
+export interface InviteInfo {
+  id: string;
+  code: string;
+  server_id: string;
+  created_by: string;
+  max_uses?: number | null;
+  use_count: number;
+  expires_at?: string | null;
+  channel_id?: string | null;
+  created_at: string;
+}
+
+export interface EventInfo {
+  id: string;
+  server_id: string;
+  name: string;
+  description?: string | null;
+  channel_id?: string | null;
+  start_time: string;
+  end_time?: string | null;
+  image_url?: string | null;
+  created_by: string;
+  status: string; // 'scheduled' | 'active' | 'completed' | 'cancelled'
+  interested_count: number;
+  created_at: string;
+}
+
+export interface RsvpInfo {
+  user_id: string;
+  status: string; // 'interested' | 'going'
+}
+
+export interface ChannelFollowInfo {
+  id: string;
+  source_channel_id: string;
+  target_channel_id: string;
+  created_by: string;
+}
+
+export interface TemplateInfo {
+  id: string;
+  name: string;
+  description?: string | null;
+  server_id: string;
+  created_by: string;
+  use_count: number;
+  created_at: string;
+}
+
+export interface ServerCommunityInfo {
+  server_id: string;
+  description?: string | null;
+  is_discoverable: boolean;
+  welcome_message?: string | null;
+  rules_text?: string | null;
+  category?: string | null;
+}
+
+// ── Permission bitfield constants ──────────────────────
+export const Permissions = {
+  VIEW_CHANNELS:        1 << 0,
+  MANAGE_CHANNELS:      1 << 1,
+  MANAGE_ROLES:         1 << 2,
+  MANAGE_SERVER:        1 << 3,
+  CREATE_INVITES:       1 << 4,
+  KICK_MEMBERS:         1 << 5,
+  BAN_MEMBERS:          1 << 6,
+  ADMINISTRATOR:        1 << 7,
+  SEND_MESSAGES:        1 << 10,
+  EMBED_LINKS:          1 << 11,
+  ATTACH_FILES:         1 << 12,
+  ADD_REACTIONS:        1 << 13,
+  MENTION_EVERYONE:     1 << 14,
+  MANAGE_MESSAGES:      1 << 15,
+  READ_MESSAGE_HISTORY: 1 << 16,
+} as const;
+
+export function hasPermission(perms: number, flag: number): boolean {
+  if (perms & Permissions.ADMINISTRATOR) return true;
+  return (perms & flag) === flag;
 }
 
 export interface PublicUserProfile {
@@ -128,6 +356,59 @@ export type ServerEvent =
   | { type: 'server_list'; servers: ServerInfo[] }
   | { type: 'unread_counts'; server_id: string; counts: UnreadCount[] }
   | { type: 'server_notice'; message: string }
+  | { type: 'role_list'; server_id: string; roles: RoleInfo[] }
+  | { type: 'role_update'; server_id: string; role: RoleInfo }
+  | { type: 'role_delete'; server_id: string; role_id: string }
+  | { type: 'member_role_update'; server_id: string; user_id: string; role_ids: string[] }
+  | { type: 'category_list'; server_id: string; categories: CategoryInfo[] }
+  | { type: 'category_update'; server_id: string; category: CategoryInfo }
+  | { type: 'category_delete'; server_id: string; category_id: string }
+  | { type: 'channel_reorder'; server_id: string; channels: ChannelPositionInfo[] }
+  | { type: 'presence_update'; server_id: string; presence: PresenceInfo }
+  | { type: 'presence_list'; server_id: string; presences: PresenceInfo[] }
+  | { type: 'user_profile'; profile: UserProfileInfo }
+  | { type: 'server_nickname_update'; server_id: string; user_id: string; nickname: string | null }
+  | { type: 'notification_settings'; server_id: string; settings: NotificationSettingInfo[] }
+  | { type: 'search_results'; server_id: string; query: string; results: SearchResultMessage[]; total_count: number; offset: number }
+  | { type: 'message_pin'; server_id: string; channel: string; pin: PinnedMessageInfo }
+  | { type: 'message_unpin'; server_id: string; channel: string; message_id: string }
+  | { type: 'pinned_messages'; server_id: string; channel: string; pins: PinnedMessageInfo[] }
+  | { type: 'thread_create'; server_id: string; parent_channel: string; thread: ThreadInfo }
+  | { type: 'thread_update'; server_id: string; thread: ThreadInfo }
+  | { type: 'thread_list'; server_id: string; channel: string; threads: ThreadInfo[] }
+  | { type: 'forum_tag_list'; server_id: string; channel: string; tags: ForumTagInfo[] }
+  | { type: 'forum_tag_update'; server_id: string; channel: string; tag: ForumTagInfo }
+  | { type: 'forum_tag_delete'; server_id: string; channel: string; tag_id: string }
+  | { type: 'bookmark_list'; bookmarks: BookmarkInfo[] }
+  | { type: 'bookmark_add'; bookmark: BookmarkInfo }
+  | { type: 'bookmark_remove'; message_id: string }
+  | { type: 'member_kick'; server_id: string; user_id: string; kicked_by: string; reason?: string | null }
+  | { type: 'member_ban'; server_id: string; user_id: string; banned_by: string; reason?: string | null }
+  | { type: 'member_unban'; server_id: string; user_id: string }
+  | { type: 'member_timeout'; server_id: string; user_id: string; timeout_until?: string | null }
+  | { type: 'slow_mode_update'; server_id: string; channel: string; seconds: number }
+  | { type: 'nsfw_update'; server_id: string; channel: string; is_nsfw: boolean }
+  | { type: 'bulk_message_delete'; server_id: string; channel: string; message_ids: string[] }
+  | { type: 'audit_log_entries'; server_id: string; entries: AuditLogEntry[] }
+  | { type: 'ban_list'; server_id: string; bans: BanInfo[] }
+  | { type: 'automod_rule_list'; server_id: string; rules: AutomodRuleInfo[] }
+  | { type: 'automod_rule_update'; server_id: string; rule: AutomodRuleInfo }
+  | { type: 'automod_rule_delete'; server_id: string; rule_id: string }
+  | { type: 'invite_list'; server_id: string; invites: InviteInfo[] }
+  | { type: 'invite_create'; server_id: string; invite: InviteInfo }
+  | { type: 'invite_delete'; server_id: string; invite_id: string }
+  | { type: 'event_list'; server_id: string; events: EventInfo[] }
+  | { type: 'event_update'; server_id: string; event: EventInfo }
+  | { type: 'event_delete'; server_id: string; event_id: string }
+  | { type: 'event_rsvp_list'; event_id: string; rsvps: RsvpInfo[] }
+  | { type: 'server_community'; community: ServerCommunityInfo }
+  | { type: 'discover_servers'; servers: ServerCommunityInfo[] }
+  | { type: 'channel_follow_list'; channel_id: string; follows: ChannelFollowInfo[] }
+  | { type: 'channel_follow_create'; follow: ChannelFollowInfo }
+  | { type: 'channel_follow_delete'; follow_id: string }
+  | { type: 'template_list'; server_id: string; templates: TemplateInfo[] }
+  | { type: 'template_update'; server_id: string; template: TemplateInfo }
+  | { type: 'template_delete'; server_id: string; template_id: string }
   | { type: 'error'; code: string; message: string };
 
 // Client → Server commands
@@ -148,12 +429,74 @@ export type ClientCommand =
   | { type: 'create_server'; name: string; icon_url?: string }
   | { type: 'join_server'; server_id: string }
   | { type: 'leave_server'; server_id: string }
-  | { type: 'create_channel'; server_id: string; name: string }
+  | { type: 'create_channel'; server_id: string; name: string; category_id?: string; is_private?: boolean }
   | { type: 'delete_channel'; server_id: string; channel: string }
   | { type: 'delete_server'; server_id: string }
   | { type: 'update_member_role'; server_id: string; user_id: string; role: string }
   | { type: 'mark_read'; server_id: string; channel: string; message_id: string }
-  | { type: 'get_unread_counts'; server_id: string };
+  | { type: 'get_unread_counts'; server_id: string }
+  | { type: 'list_roles'; server_id: string }
+  | { type: 'create_role'; server_id: string; name: string; color?: string; permissions?: number; position?: number }
+  | { type: 'update_role'; server_id: string; role_id: string; name?: string; color?: string; permissions?: number; position?: number }
+  | { type: 'delete_role'; server_id: string; role_id: string }
+  | { type: 'assign_role'; server_id: string; user_id: string; role_id: string }
+  | { type: 'remove_role'; server_id: string; user_id: string; role_id: string }
+  | { type: 'list_categories'; server_id: string }
+  | { type: 'create_category'; server_id: string; name: string }
+  | { type: 'update_category'; server_id: string; category_id: string; name?: string; position?: number }
+  | { type: 'delete_category'; server_id: string; category_id: string }
+  | { type: 'reorder_channels'; server_id: string; channels: ChannelPositionInfo[] }
+  | { type: 'set_presence'; status: string; custom_status?: string; status_emoji?: string }
+  | { type: 'get_presences'; server_id: string }
+  | { type: 'set_server_nickname'; server_id: string; nickname?: string }
+  | { type: 'search_messages'; server_id: string; query: string; channel?: string; limit?: number; offset?: number }
+  | { type: 'update_notification_settings'; server_id: string; channel_id?: string; level: string; suppress_everyone?: boolean; suppress_roles?: boolean; muted?: boolean; mute_until?: string }
+  | { type: 'get_notification_settings'; server_id: string }
+  | { type: 'get_user_profile'; user_id: string }
+  | { type: 'pin_message'; server_id: string; channel: string; message_id: string }
+  | { type: 'unpin_message'; server_id: string; channel: string; message_id: string }
+  | { type: 'get_pinned_messages'; server_id: string; channel: string }
+  | { type: 'create_thread'; server_id: string; parent_channel: string; name: string; message_id: string; is_private?: boolean }
+  | { type: 'archive_thread'; server_id: string; thread_id: string }
+  | { type: 'list_threads'; server_id: string; channel: string }
+  | { type: 'add_bookmark'; message_id: string; note?: string }
+  | { type: 'remove_bookmark'; message_id: string }
+  | { type: 'list_bookmarks' }
+  | { type: 'kick_member'; server_id: string; user_id: string; reason?: string }
+  | { type: 'ban_member'; server_id: string; user_id: string; reason?: string; delete_message_days?: number }
+  | { type: 'unban_member'; server_id: string; user_id: string }
+  | { type: 'list_bans'; server_id: string }
+  | { type: 'timeout_member'; server_id: string; user_id: string; timeout_until?: string; reason?: string }
+  | { type: 'set_slow_mode'; server_id: string; channel: string; seconds: number }
+  | { type: 'set_nsfw'; server_id: string; channel: string; is_nsfw: boolean }
+  | { type: 'bulk_delete_messages'; server_id: string; channel: string; message_ids: string[] }
+  | { type: 'get_audit_log'; server_id: string; action_type?: string; limit?: number; before?: string }
+  | { type: 'create_automod_rule'; server_id: string; name: string; rule_type: string; config: string; action_type: string; timeout_duration_seconds?: number }
+  | { type: 'update_automod_rule'; server_id: string; rule_id: string; name: string; enabled: boolean; config: string; action_type: string; timeout_duration_seconds?: number }
+  | { type: 'delete_automod_rule'; server_id: string; rule_id: string }
+  | { type: 'list_automod_rules'; server_id: string }
+  | { type: 'create_invite'; server_id: string; max_uses?: number; expires_at?: string; channel_id?: string }
+  | { type: 'list_invites'; server_id: string }
+  | { type: 'delete_invite'; server_id: string; invite_id: string }
+  | { type: 'use_invite'; code: string }
+  | { type: 'create_event'; server_id: string; name: string; description?: string; channel_id?: string; start_time: string; end_time?: string; image_url?: string }
+  | { type: 'list_events'; server_id: string }
+  | { type: 'update_event_status'; server_id: string; event_id: string; status: string }
+  | { type: 'delete_event'; server_id: string; event_id: string }
+  | { type: 'set_rsvp'; server_id: string; event_id: string; status: string }
+  | { type: 'remove_rsvp'; server_id: string; event_id: string }
+  | { type: 'list_rsvps'; event_id: string }
+  | { type: 'update_community_settings'; server_id: string; description?: string; is_discoverable: boolean; welcome_message?: string; rules_text?: string; category?: string }
+  | { type: 'get_community_settings'; server_id: string }
+  | { type: 'discover_servers'; category?: string }
+  | { type: 'accept_rules'; server_id: string }
+  | { type: 'set_announcement_channel'; server_id: string; channel: string; is_announcement: boolean }
+  | { type: 'follow_channel'; source_channel_id: string; target_channel_id: string }
+  | { type: 'unfollow_channel'; follow_id: string }
+  | { type: 'list_channel_follows'; channel_id: string }
+  | { type: 'create_template'; server_id: string; name: string; description?: string }
+  | { type: 'list_templates'; server_id: string }
+  | { type: 'delete_template'; server_id: string; template_id: string };
 
 // ── Helpers ─────────────────────────────────────────────
 

@@ -6,13 +6,85 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-### Added
-- Phase 5: React Frontend (#14)
-- Phase 4: OAuth Authentication (#13)
-- Phase 3: IRC Protocol — RFC 2812 parser, TCP listener, command dispatch, numeric replies (#12)
-- Phase 2: Database and Persistence — SQLite with WAL mode, message/channel/membership persistence (#11)
-- Phase 1: Chat Engine + WebSocket foundation (#2)
-- Plan Concord - open source IRC-compatible chat platform (#1)
+### Added — Phase 6: Moderation (#54)
+- Kick members from servers with reason tracking
+- Ban/unban members with optional message history deletion (0-7 days)
+- Member timeout/mute with configurable duration
+- Per-channel slow mode (configurable cooldown in seconds)
+- Audit log capturing all mod actions, role changes, and server edits
+- AutoMod system with keyword filter, mention spam detection, and link filter
+- Configurable automod actions: delete, timeout, or flag
+- Bulk message deletion (up to 100 messages)
+- NSFW channel designation with age gate
+- ModerationPanel UI with Bans, Audit Log, and AutoMod tabs
+- Right-click context menu on members for kick/ban/timeout
+- IRC NOTICE mapping for kick and ban events
+- Migration 010: bans, audit_log, automod_rules tables
+
+### Added — Phase 5: Threads & Pinning (#53)
+- Message pinning with 50-per-channel limit
+- Public threads spawned from messages
+- Private threads with invite-only access
+- Forum channels with tag-based categorization
+- Personal message bookmarks with notes
+- Thread auto-archive after inactivity
+- IRC NOTICE mapping for pin/unpin and thread events
+- Migration 009: pinned_messages, forum_tags, thread_tags, bookmarks tables
+
+### Added — Phase 4: User Experience (#52)
+- User presence status (online/idle/DND/invisible)
+- Custom status with text and emoji
+- User profiles with bio, pronouns, and banner
+- Per-server display names (nicknames)
+- Per-server and per-channel notification settings
+- Browser desktop notifications
+- Quick switcher (Ctrl+K) with fuzzy search
+- Message search with FTS5 and filter operators (from:, in:, has:, before:, after:)
+- Migration 008: user_presence, user_profiles, notification_settings tables; FTS5 virtual table
+
+### Added — Phase 3: Organization & Permissions (#51)
+- Custom roles with bitfield permissions (u64, 20+ permission flags)
+- Channel categories with collapsible sections
+- Drag-and-drop channel reordering
+- Private channels with membership-based access control
+- Channel permission overrides (per-role and per-user)
+- Role colors displayed in chat and member list
+- Server folders (client-side, localStorage-persisted)
+- ServerSettings panel with roles and channels tabs
+- Effective permission algorithm mirroring Discord's model
+- Migration 007: roles, user_roles, channel_categories, channel_permission_overrides tables
+
+### Added — Phase 2: Media & Files (#50)
+- File and image upload system with configurable storage
+- Image preview and lightbox viewer
+- Inline video and audio players
+- Link embed previews via Open Graph unfurling
+- Custom server emoji with :name: rendering
+- GIF support and optional Tenor GIF picker
+- Voice/audio message recording with waveform playback
+- AT Protocol PDS blob storage for Bluesky users
+- Migration 004-006: attachments, embed_cache, custom_emoji tables
+
+### Added — Phase 1: Core Messaging (#49)
+- Message editing with "edited" indicator
+- Message deletion (soft delete)
+- Markdown and text formatting (bold, italic, code, blockquotes, spoilers)
+- @mentions with notification highlighting
+- Reply/quote to specific messages
+- Emoji reactions on messages
+- Typing indicators (ephemeral, 8s auto-expire)
+- Read state and unread indicators
+- Migration 003: edited_at, deleted_at, reply_to_id on messages; mentions, reactions, read_states tables
+
+### Added — Foundation
+- Admin bootstrap via config (#140)
+- Multi-server architecture with server-aware ChatEngine
+- React 19 + TypeScript + Vite + Tailwind 4 frontend
+- OAuth authentication (GitHub, Google, Bluesky/AT Protocol)
+- IRC protocol support (RFC 2812 parser, TCP listener, command dispatch)
+- SQLite persistence with WAL mode
+- Chat engine with protocol-agnostic event system
+- WebSocket handler with axum router
 
 ### Fixed
 - Fix broken PDS blob URL missing did parameter (#135)
@@ -20,61 +92,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing migration 4 and add emoji picker (#125)
 
 ### Changed
+- Update README with install instructions and ngrok setup (#143)
 - Clean repo of build artifacts (#136)
 - Persist AT Protocol signing key across server restarts (#133)
-- AT Protocol blob storage for media uploads (#127)
-- Update attachment serving for PDS blob URLs (#131)
-- Modify upload endpoint to use PDS blob storage (#130)
-- Implement PDS blob upload client with DPoP auth (#129)
-- Store AT Protocol credentials during OAuth callback (#128)
-- Phase 2: Media and File Uploads (#50)
-- Add voice/audio message recording with waveform playback (#71)
-- Add GIF support and optional Tenor GIF picker (#70)
-- Add custom server emoji with :name: rendering (#69)
-- Add link embed previews via Open Graph (#68)
-- Add inline video and audio players (#67)
-- Add image preview and lightbox viewer (#66)
-- Add file and image upload system (#65)
-- Phase 1: Core Messaging Enhancements (#49)
-- Add read state and unread indicators (#64)
-- Add @mentions with notification highlighting (#60)
-- Add typing indicators (#63)
-- Add emoji reactions on messages (#62)
-- Add reply/quote to specific messages (#61)
-- Add markdown and text formatting in messages (#59)
-- Add message deletion (soft delete) (#58)
-- Add message editing with edited indicator (#57)
-- Frontend UI components for multi-server (#44)
-- Frontend stores + types for multi-server support (#43)
-- IRC protocol adaptation for multi-server channels (#42)
-- WebSocket + REST protocol update for multi-server (#41)
-- ChatEngine refactoring for server-aware architecture (#40)
-- Database schema migration for multi-server support (#39)
-- Wire frontend build output into Rust server static serving (#36)
-- Initialize Vite + React + TypeScript + Tailwind project (#35)
-- Build and test OAuth authentication (#34)
-- Add user profile and token management REST endpoints (#33)
-- Implement IRC PASS token validation (#32)
-- Implement auth middleware for REST and WebSocket (#31)
-- Implement session/token management (JWT, IRC tokens) (#30)
-- Implement OAuth provider config and flow handlers (#29)
-- Add OAuth and auth dependencies (oauth2, argon2, jsonwebtoken) (#28)
-- Build and verify two-tab chat works (#10)
-- Create HTML test page for WebSocket testing (#9)
-- Implement main.rs entry point and config (#8)
-- Implement WebSocket handler and axum router (#7)
-- Implement ChatEngine core with message routing (#6)
-- Implement UserSession and Channel state types (#5)
-- Implement ChatEvent enum and core types (#4)
-- Initialize Cargo workspace and project structure (#3)
-- Build and test IRC protocol with cargo test (#27)
-- Implement PING/PONG keepalive and registration flow (#26)
-- Implement IRC command dispatch (NICK, USER, JOIN, PART, PRIVMSG, etc.) (#25)
-- Implement IRC TCP listener and connection handler (#24)
-- Implement IRC numeric reply constants (#23)
-- Implement IRC message parser and formatter (RFC 2812) (#22)
-- Add channel and membership persistence (#21)
-- Add REST endpoint for message history (#20)
-- Wire persistence into ChatEngine (#19)
-- Implement db module with models and query functions (#18)
-- Add sqlx + SQLite dependencies and create migration files (#17)

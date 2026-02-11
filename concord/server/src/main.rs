@@ -34,6 +34,29 @@ async fn main() {
         .await
         .expect("failed to run database migrations");
 
+    // Bootstrap admin users from config
+    for username in &config.admin.admin_users {
+        match sqlx::query_scalar::<_, String>("SELECT id FROM users WHERE username = ?")
+            .bind(username)
+            .fetch_optional(&pool)
+            .await
+        {
+            Ok(Some(user_id)) => {
+                let _ = sqlx::query("UPDATE users SET is_system_admin = 1 WHERE id = ?")
+                    .bind(&user_id)
+                    .execute(&pool)
+                    .await;
+                info!(%username, "bootstrapped as system admin");
+            }
+            Ok(None) => {
+                info!(%username, "admin user not found yet (will need manual promotion after first login)");
+            }
+            Err(e) => {
+                tracing::warn!(%username, error = %e, "failed to bootstrap admin user");
+            }
+        }
+    }
+
     // Create the shared chat engine with database
     let engine = Arc::new(ChatEngine::new(Some(pool.clone())));
 

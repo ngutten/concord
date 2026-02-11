@@ -22,6 +22,9 @@ serde_json = "1.0"
 # Concurrent data structures
 dashmap = "6.1"
 
+# Permission bitfields
+bitflags = "2"
+
 # Identifiers
 uuid = { version = "1.20", features = ["v4", "serde"] }
 

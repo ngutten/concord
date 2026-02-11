@@ -46,15 +46,17 @@ pub async fn get_channel_by_name(
         .await
 }
 
-/// List all channels in a server.
+/// List all channels in a server, ordered by position then name.
 pub async fn list_channels(
     pool: &SqlitePool,
     server_id: &str,
 ) -> Result<Vec<ChannelRow>, sqlx::Error> {
-    sqlx::query_as::<_, ChannelRow>("SELECT * FROM channels WHERE server_id = ? ORDER BY name")
-        .bind(server_id)
-        .fetch_all(pool)
-        .await
+    sqlx::query_as::<_, ChannelRow>(
+        "SELECT * FROM channels WHERE server_id = ? ORDER BY position, name",
+    )
+    .bind(server_id)
+    .fetch_all(pool)
+    .await
 }
 
 /// Get all default channels in a server.
@@ -168,4 +170,122 @@ pub async fn get_user_channels(
     .bind(server_id)
     .fetch_all(pool)
     .await
+}
+
+/// Update a channel's position.
+pub async fn update_channel_position(
+    pool: &SqlitePool,
+    channel_id: &str,
+    position: i32,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE channels SET position = ? WHERE id = ?")
+        .bind(position)
+        .bind(channel_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Update a channel's category.
+pub async fn update_channel_category(
+    pool: &SqlitePool,
+    channel_id: &str,
+    category_id: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE channels SET category_id = ? WHERE id = ?")
+        .bind(category_id)
+        .bind(channel_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Set a channel's private flag.
+pub async fn set_channel_private(
+    pool: &SqlitePool,
+    channel_id: &str,
+    is_private: bool,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE channels SET is_private = ? WHERE id = ?")
+        .bind(is_private as i32)
+        .bind(channel_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Get channel permission overrides.
+pub async fn get_channel_overrides(
+    pool: &SqlitePool,
+    channel_id: &str,
+) -> Result<Vec<crate::db::models::ChannelPermissionOverrideRow>, sqlx::Error> {
+    sqlx::query_as::<_, crate::db::models::ChannelPermissionOverrideRow>(
+        "SELECT * FROM channel_permission_overrides WHERE channel_id = ?",
+    )
+    .bind(channel_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Set (upsert) a channel permission override.
+pub async fn set_channel_override(
+    pool: &SqlitePool,
+    id: &str,
+    channel_id: &str,
+    target_type: &str,
+    target_id: &str,
+    allow_bits: i64,
+    deny_bits: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO channel_permission_overrides \
+         (id, channel_id, target_type, target_id, allow_bits, deny_bits) \
+         VALUES (?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(channel_id, target_type, target_id) DO UPDATE SET \
+         allow_bits = excluded.allow_bits, deny_bits = excluded.deny_bits",
+    )
+    .bind(id)
+    .bind(channel_id)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(allow_bits)
+    .bind(deny_bits)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Delete a channel permission override.
+pub async fn delete_channel_override(
+    pool: &SqlitePool,
+    channel_id: &str,
+    target_type: &str,
+    target_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM channel_permission_overrides \
+         WHERE channel_id = ? AND target_type = ? AND target_id = ?",
+    )
+    .bind(channel_id)
+    .bind(target_type)
+    .bind(target_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Check if a user is a member of a specific channel (for private channel access).
+pub async fn is_channel_member(
+    pool: &SqlitePool,
+    channel_id: &str,
+    user_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM channel_members WHERE channel_id = ? AND user_id = ?",
+    )
+    .bind(channel_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(count > 0)
 }

@@ -127,6 +127,30 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/servers/{id}/emoji/{emoji_id}",
             axum::routing::delete(rest_api::delete_server_emoji),
         )
+        // User profiles
+        .route(
+            "/api/users/{id}/profile",
+            axum::routing::get(rest_api::get_user_full_profile),
+        )
+        .route(
+            "/api/profile",
+            axum::routing::patch(rest_api::update_profile),
+        )
+        // Search
+        .route(
+            "/api/search",
+            axum::routing::get(rest_api::search_messages),
+        )
+        // Invite preview (public)
+        .route(
+            "/api/invite/{code}",
+            axum::routing::get(rest_api::get_invite_preview),
+        )
+        // Server discovery (public)
+        .route(
+            "/api/discover",
+            axum::routing::get(rest_api::discover_servers),
+        )
         // Static files with SPA fallback — unmatched routes serve index.html
         .fallback_service(ServeDir::new("static").fallback(ServeFile::new("static/index.html")))
         .layer(cors)

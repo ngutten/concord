@@ -13,6 +13,14 @@ pub struct ServerConfig {
     pub auth: AuthSection,
     pub oauth: OAuthSection,
     pub storage: StorageSection,
+    pub admin: AdminSection,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct AdminSection {
+    /// Usernames that should be auto-promoted to system admin on startup.
+    pub admin_users: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -163,6 +171,10 @@ impl ServerConfig {
             && let Ok(mb) = v.parse()
         {
             self.storage.max_file_size_mb = mb;
+        }
+        // Admin env overrides
+        if let Ok(v) = std::env::var("ADMIN_USERS") {
+            self.admin.admin_users = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
         }
     }
 

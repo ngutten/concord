@@ -427,11 +427,133 @@ fn event_to_irc_lines(engine: &ChatEngine, my_nick: &str, event: &ChatEvent) -> 
         ChatEvent::TypingStart { .. } => vec![],
         // Embeds are WebSocket-only (rich previews don't map to IRC)
         ChatEvent::MessageEmbed { .. } => vec![],
+        // Phase 5: Pinning — send NOTICEs for pin/unpin actions
+        ChatEvent::MessagePin {
+            server_id,
+            channel,
+            pin,
+        } => {
+            let irc_channel = to_irc_channel(engine, server_id, channel);
+            vec![format!(
+                ":{} NOTICE {} :\u{1f4cc} {} pinned a message from {}",
+                formatter::server_name(),
+                irc_channel,
+                pin.pinned_by,
+                pin.from
+            )]
+        }
+        ChatEvent::MessageUnpin {
+            server_id, channel, ..
+        } => {
+            let irc_channel = to_irc_channel(engine, server_id, channel);
+            vec![format!(
+                ":{} NOTICE {} :\u{1f4cc} Message unpinned in {}",
+                formatter::server_name(),
+                irc_channel,
+                irc_channel
+            )]
+        }
+        // Phase 5: Threads — send NOTICE for new thread creation and updates
+        ChatEvent::ThreadCreate {
+            server_id,
+            parent_channel,
+            thread,
+        } => {
+            let irc_channel = to_irc_channel(engine, server_id, parent_channel);
+            vec![format!(
+                ":{} NOTICE {} :\u{1f9f5} New thread: {}",
+                formatter::server_name(),
+                irc_channel,
+                thread.name
+            )]
+        }
+        ChatEvent::ThreadUpdate {
+            server_id: _,
+            thread,
+        } => {
+            // ThreadUpdate has no channel field; use server_id for context
+            let action = if thread.archived { "archived" } else { "unarchived" };
+            vec![format!(
+                ":{} NOTICE {} :\u{1f9f5} Thread \"{}\" was {}",
+                formatter::server_name(),
+                my_nick,
+                thread.name,
+                action
+            )]
+        }
+        // Phase 6: Moderation — kick and ban get NOTICEs, rest are WS-only
+        ChatEvent::MemberKick { server_id: _, user_id: _, kicked_by, reason } => {
+            let reason_text = reason.as_deref().unwrap_or("No reason given");
+            vec![format!(
+                ":{} NOTICE {} :{} kicked a member: {}",
+                formatter::server_name(),
+                my_nick,
+                kicked_by,
+                reason_text
+            )]
+        }
+        ChatEvent::MemberBan { server_id: _, user_id: _, banned_by, reason } => {
+            let reason_text = reason.as_deref().unwrap_or("No reason given");
+            vec![format!(
+                ":{} NOTICE {} :{} banned a member: {}",
+                formatter::server_name(),
+                my_nick,
+                banned_by,
+                reason_text
+            )]
+        }
+        ChatEvent::MemberUnban { .. } => vec![],
+        ChatEvent::MemberTimeout { .. } => vec![],
+        ChatEvent::SlowModeUpdate { .. } => vec![],
+        ChatEvent::NsfwUpdate { .. } => vec![],
+        ChatEvent::BulkMessageDelete { .. } => vec![],
+        ChatEvent::AuditLogEntries { .. } => vec![],
+        ChatEvent::BanList { .. } => vec![],
+        ChatEvent::AutomodRuleList { .. } => vec![],
+        ChatEvent::AutomodRuleUpdate { .. } => vec![],
+        ChatEvent::AutomodRuleDelete { .. } => vec![],
         // These events are WebSocket-specific and don't map to IRC
         ChatEvent::ChannelList { .. }
         | ChatEvent::History { .. }
         | ChatEvent::ServerList { .. }
-        | ChatEvent::UnreadCounts { .. } => vec![],
+        | ChatEvent::UnreadCounts { .. }
+        | ChatEvent::RoleList { .. }
+        | ChatEvent::RoleUpdate { .. }
+        | ChatEvent::RoleDelete { .. }
+        | ChatEvent::MemberRoleUpdate { .. }
+        | ChatEvent::CategoryList { .. }
+        | ChatEvent::CategoryUpdate { .. }
+        | ChatEvent::CategoryDelete { .. }
+        | ChatEvent::ChannelReorder { .. }
+        | ChatEvent::PresenceUpdate { .. }
+        | ChatEvent::PresenceList { .. }
+        | ChatEvent::UserProfile { .. }
+        | ChatEvent::ServerNicknameUpdate { .. }
+        | ChatEvent::NotificationSettings { .. }
+        | ChatEvent::SearchResults { .. }
+        | ChatEvent::PinnedMessages { .. }
+        | ChatEvent::ThreadList { .. }
+        | ChatEvent::ForumTagList { .. }
+        | ChatEvent::ForumTagUpdate { .. }
+        | ChatEvent::ForumTagDelete { .. }
+        | ChatEvent::BookmarkList { .. }
+        | ChatEvent::BookmarkAdd { .. }
+        | ChatEvent::BookmarkRemove { .. }
+        | ChatEvent::InviteList { .. }
+        | ChatEvent::InviteCreate { .. }
+        | ChatEvent::InviteDelete { .. }
+        | ChatEvent::EventList { .. }
+        | ChatEvent::EventUpdate { .. }
+        | ChatEvent::EventDelete { .. }
+        | ChatEvent::EventRsvpList { .. }
+        | ChatEvent::ServerCommunity { .. }
+        | ChatEvent::DiscoverServers { .. }
+        | ChatEvent::ChannelFollowList { .. }
+        | ChatEvent::ChannelFollowCreate { .. }
+        | ChatEvent::ChannelFollowDelete { .. }
+        | ChatEvent::TemplateList { .. }
+        | ChatEvent::TemplateUpdate { .. }
+        | ChatEvent::TemplateDelete { .. } => vec![],
     }
 }
 

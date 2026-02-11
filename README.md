@@ -6,45 +6,164 @@ Any IRC client (HexChat, irssi, WeeChat) connects alongside web users — messag
 
 ## Features
 
-- **Multi-server architecture**: Discord-style servers with isolated channels, members, and permissions
-- **Dual protocol**: WebSocket (browser) + IRC (RFC 2812) on the same instance
-- **Protocol-agnostic engine**: Core chat logic never imports protocol-specific code
-- **OAuth authentication**: GitHub, Google, and Bluesky (AT Protocol) login
-- **Role-based permissions**: Owner, Admin, Moderator, and Member roles per server
-- **IRC access tokens**: Web users generate argon2-hashed tokens to connect from any IRC client
-- **Persistent history**: SQLite (WAL mode) with paginated message history
-- **Rate limiting**: Token-bucket rate limiter on messages (per-user)
-- **Direct messages**: Cross-protocol DMs between any connected users
-- **Modern web UI**: React + TypeScript with a Discord-like layout
-- **Self-hostable**: Single binary + static files, or use Docker
+### Core
+- **Multi-server architecture** — Discord-style servers with isolated channels, members, and permissions
+- **Dual protocol** — WebSocket (browser) + IRC (RFC 2812) on the same instance
+- **Protocol-agnostic engine** — core chat logic never imports protocol-specific code
+- **OAuth authentication** — GitHub, Google, and Bluesky (AT Protocol) login
+- **Self-hostable** — single binary + static files, or use Docker
 
-## Quick Start
+### Messaging
+- Message editing, deletion, and reply threads
+- Markdown formatting (bold, italic, code, blockquotes, spoilers)
+- @mentions with notification highlighting
+- Emoji reactions and custom server emoji
+- Typing indicators and read state tracking
+- File uploads with image/video/audio preview
+- Link embed previews via Open Graph
+- Message pinning (50 per channel)
+- Full-text search with filter operators (`from:`, `in:`, `has:`, `before:`, `after:`)
 
-### Prerequisites
+### Organization
+- Channel categories with collapsible sections
+- Drag-and-drop channel reordering
+- Private channels with membership-based access
+- Custom roles with bitfield permissions (20+ flags)
+- Channel permission overrides (per-role and per-user)
+- Role colors in chat and member list
+- Client-side server folders
 
-- Rust 1.84+ (for the server)
-- Node.js 22+ (for the web frontend)
+### Threads & Forums
+- Public and private threads spawned from messages
+- Forum channels with tag-based categorization
+- Thread auto-archive after inactivity
+- Personal message bookmarks with notes
 
-### Build from source
+### Moderation
+- Kick, ban, and timeout members
+- Per-channel slow mode
+- Audit log for all moderation actions
+- AutoMod with keyword filter, mention spam detection, and link filter
+- Bulk message deletion
+- NSFW channel designation
+
+### Community
+- Invite links with expiry and use limits
+- Scheduled events with RSVP
+- Server discovery directory
+- Announcement channels with cross-posting
+- Customizable welcome screen and rules
+- Server templates
+
+### User Experience
+- Presence status (online, idle, DND, invisible)
+- Custom status with text and emoji
+- User profiles with bio, pronouns, and banner
+- Per-server display names
+- Per-server and per-channel notification settings
+- Browser desktop notifications
+- Quick switcher (Ctrl+K)
+
+## Prerequisites
+
+| Dependency | Version | Purpose |
+|---|---|---|
+| [Rust](https://www.rust-lang.org/tools/install) | 1.84+ | Server compilation |
+| [Node.js](https://nodejs.org/) | 22+ | Frontend build |
+| [Git](https://git-scm.com/) | any | Clone the repo |
+
+**Optional:**
+
+| Tool | Purpose |
+|---|---|
+| [ngrok](https://ngrok.com/) | Expose local server for OAuth callbacks and mobile testing |
+| [Docker](https://www.docker.com/) | Containerized deployment |
+| [cargo-watch](https://crates.io/crates/cargo-watch) | Auto-restart server on code changes |
+
+## Installation
+
+### 1. Clone the repository
 
 ```bash
-# Build the frontend
-cd web
-npm ci
-npm run build
-cp -r dist/ ../server/static/
-cd ..
-
-# Build the server
-cd server
-cargo build --release
+git clone https://github.com/your-org/concord.git
+cd concord
 ```
 
-### Run
+### 2. Build the frontend
 
 ```bash
-# From the server directory
+cd concord/web
+npm ci
+npm run build
+```
+
+This produces a `dist/` directory with the compiled React app.
+
+### 3. Copy frontend assets to the server
+
+The Rust server serves the frontend as static files from its `static/` directory:
+
+```bash
+# From the repository root
+cp -r concord/web/dist/* concord/server/static/
+```
+
+On Windows (PowerShell):
+```powershell
+Copy-Item -Recurse concord/web/dist/* concord/server/static/
+```
+
+### 4. Configure the server
+
+```bash
+cd concord/server
+cp ../concord.example.toml concord.toml
+```
+
+Edit `concord.toml`:
+
+```toml
+[server]
+web_address = "0.0.0.0:8080"
+irc_address = "0.0.0.0:6667"
+
+[database]
+url = "sqlite:concord.db?mode=rwc"
+
+[auth]
+jwt_secret = "change-me-to-a-random-secret"   # CHANGE THIS
+session_expiry_hours = 720                      # 30 days
+public_url = "http://localhost:8080"            # or your ngrok/production URL
+
+[oauth.github]
+client_id = ""
+client_secret = ""
+
+[oauth.google]
+client_id = ""
+client_secret = ""
+
+[storage]
+upload_dir = "uploads"
+max_file_size_mb = 100
+
+[admin]
+admin_users = []   # usernames auto-promoted to system admin
+```
+
+Every TOML value can be overridden with an environment variable (see [Configuration Reference](#configuration-reference)).
+
+### 5. Build and run the server
+
+```bash
+cd concord/server
+cargo build --release
 ./target/release/concord-server
+```
+
+On Windows:
+```powershell
+.\target\release\concord-server.exe
 ```
 
 The server starts on:
@@ -54,29 +173,161 @@ The server starts on:
 ### Docker
 
 ```bash
+cd concord
+
 # Copy and edit the config
 cp concord.example.toml concord.toml
+# Edit concord.toml with your settings
 
 # Build and run
 docker compose up -d
 ```
 
-## Configuration
+The Docker image is a multi-stage build (Rust compile + Node build + slim Debian runtime). Data is persisted in a named volume.
 
-Concord loads configuration from `concord.toml` (see `concord.example.toml`). Environment variables override TOML values.
+## Development Setup
 
-| Setting | Env Variable | Default |
-|---|---|---|
-| Web listen address | `WEB_ADDRESS` | `0.0.0.0:8080` |
-| IRC listen address | `IRC_ADDRESS` | `0.0.0.0:6667` |
-| Database URL | `DATABASE_URL` | `sqlite:concord.db?mode=rwc` |
-| JWT secret | `JWT_SECRET` | `concord-dev-secret-change-me` |
-| Session expiry | `SESSION_EXPIRY_HOURS` | `720` (30 days) |
-| Public URL | `PUBLIC_URL` | `http://localhost:8080` |
-| GitHub OAuth | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | — |
-| Google OAuth | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | — |
+### Running the frontend dev server
 
-Bluesky login requires no configuration — it uses the AT Protocol OAuth flow with your instance's public URL.
+The Vite dev server provides hot module replacement and proxies API/WebSocket requests to the Rust backend:
+
+```bash
+cd concord/web
+npm install
+npm run dev
+```
+
+This starts Vite on http://localhost:3000, proxying `/api` and `/ws` to `http://localhost:8080`.
+
+### Running the backend with auto-reload
+
+```bash
+cd concord/server
+cargo install cargo-watch   # one-time
+cargo watch -x run
+```
+
+### ngrok Setup (for OAuth and external access)
+
+OAuth providers (GitHub, Google, Bluesky) require a publicly reachable callback URL. During local development, [ngrok](https://ngrok.com/) provides a stable HTTPS tunnel to your machine.
+
+#### 1. Install ngrok
+
+**macOS:**
+```bash
+brew install ngrok
+```
+
+**Windows (winget):**
+```powershell
+winget install ngrok.ngrok
+```
+
+**Windows (Chocolatey):**
+```powershell
+choco install ngrok
+```
+
+**Linux:**
+```bash
+curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+  | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
+  | sudo tee /etc/apt/sources.list.d/ngrok.list
+sudo apt update && sudo apt install ngrok
+```
+
+Or download directly from https://ngrok.com/download.
+
+#### 2. Authenticate ngrok
+
+Sign up at https://dashboard.ngrok.com and copy your auth token:
+
+```bash
+ngrok config add-authtoken YOUR_AUTH_TOKEN
+```
+
+#### 3. Reserve a free static domain (recommended)
+
+Free ngrok accounts can reserve one static domain, which gives you a stable URL that doesn't change between restarts:
+
+1. Go to https://dashboard.ngrok.com/domains
+2. Click **Create Domain** — you'll get something like `your-name-here.ngrok-free.dev`
+
+#### 4. Start the tunnel
+
+```bash
+# With a reserved static domain (recommended)
+ngrok http --url=your-name-here.ngrok-free.dev 8080
+
+# Or with a random URL (changes every restart)
+ngrok http 8080
+```
+
+#### 5. Configure Concord to use the ngrok URL
+
+Set `public_url` in `concord.toml` to your ngrok domain:
+
+```toml
+[auth]
+public_url = "https://your-name-here.ngrok-free.dev"
+```
+
+Or via environment variable:
+```bash
+PUBLIC_URL=https://your-name-here.ngrok-free.dev cargo run
+```
+
+This is required so that:
+- OAuth callback URLs point to the correct host
+- Session cookies are set with the `Secure` flag (ngrok uses HTTPS)
+- Bluesky AT Protocol OAuth can complete the DPoP flow
+
+#### 6. Register OAuth apps with the ngrok URL
+
+**GitHub:**
+1. Go to https://github.com/settings/developers → **New OAuth App**
+2. Set **Homepage URL** to `https://your-name-here.ngrok-free.dev`
+3. Set **Authorization callback URL** to `https://your-name-here.ngrok-free.dev/api/auth/github/callback`
+4. Copy the Client ID and Client Secret into `concord.toml`
+
+**Google:**
+1. Go to https://console.cloud.google.com/apis/credentials → **Create OAuth client ID**
+2. Add `https://your-name-here.ngrok-free.dev` to **Authorized JavaScript origins**
+3. Add `https://your-name-here.ngrok-free.dev/api/auth/google/callback` to **Authorized redirect URIs**
+4. Copy the Client ID and Client Secret into `concord.toml`
+
+**Bluesky:**
+No configuration needed — Bluesky uses AT Protocol OAuth, which auto-discovers your server's metadata at `/.well-known/`. Just ensure `public_url` is set correctly.
+
+### Running tests
+
+```bash
+cd concord/server
+cargo test
+```
+
+51 tests covering the chat engine, IRC parser/formatter, JWT auth, token hashing, permissions, and moderation.
+
+## Configuration Reference
+
+Concord loads configuration from `concord.toml`. Environment variables override TOML values.
+
+| Setting | TOML Path | Env Variable | Default |
+|---|---|---|---|
+| Web listen address | `server.web_address` | `WEB_ADDRESS` | `0.0.0.0:8080` |
+| IRC listen address | `server.irc_address` | `IRC_ADDRESS` | `0.0.0.0:6667` |
+| Database URL | `database.url` | `DATABASE_URL` | `sqlite:concord.db?mode=rwc` |
+| JWT secret | `auth.jwt_secret` | `JWT_SECRET` | `concord-dev-secret-change-me` |
+| Session expiry | `auth.session_expiry_hours` | `SESSION_EXPIRY_HOURS` | `720` (30 days) |
+| Public URL | `auth.public_url` | `PUBLIC_URL` | `http://localhost:8080` |
+| Upload directory | `storage.upload_dir` | `UPLOAD_DIR` | `uploads` |
+| Max file size (MB) | `storage.max_file_size_mb` | `MAX_FILE_SIZE_MB` | `100` |
+| GitHub OAuth | `oauth.github.client_id` | `GITHUB_CLIENT_ID` | — |
+| GitHub OAuth | `oauth.github.client_secret` | `GITHUB_CLIENT_SECRET` | — |
+| Google OAuth | `oauth.google.client_id` | `GOOGLE_CLIENT_ID` | — |
+| Google OAuth | `oauth.google.client_secret` | `GOOGLE_CLIENT_SECRET` | — |
+| Admin users | `admin.admin_users` | `ADMIN_USERS` (comma-separated) | `[]` |
 
 ## IRC Usage
 
@@ -119,7 +370,7 @@ IRC Clients ──TCP──▸ ┌───────────────�
                      │  ├─────────────────┤ │
                      │  │    SQLite       │ │
                      │  └─────────────────┘ │
-                     └─────────────────────┘
+                     └──────────────────────┘
 ```
 
 Dependency direction: `irc` → `engine` ← `web`. The engine knows nothing about protocols.
@@ -141,9 +392,8 @@ All endpoints are under `/api`. Authenticated endpoints require a `concord_sessi
 
 ### Public
 - `GET /api/auth/status` — available OAuth providers
-- `GET /api/channels?server_id=` — list channels
-- `GET /api/channels/{name}/messages?server_id=` — message history
-- `GET /api/users/{nickname}` — public profile lookup
+- `GET /api/invite/{code}` — invite link preview
+- `GET /api/discover` — server discovery directory
 
 ### Authenticated
 - `GET /api/me` — current user profile
@@ -157,32 +407,14 @@ All endpoints are under `/api`. Authenticated endpoints require a `concord_sessi
 - `GET /api/tokens` — list your IRC tokens
 - `POST /api/tokens` — generate an IRC token
 - `DELETE /api/tokens/{id}` — revoke an IRC token
+- `GET /api/channels?server_id=` — list channels
+- `GET /api/channels/{name}/messages?server_id=` — message history
+- `GET /api/users/{nickname}` — public profile lookup
 
 ### Admin
 - `GET /api/admin/servers` — list all servers
 - `DELETE /api/admin/servers/{id}` — delete any server
 - `PUT /api/admin/users/{id}/admin` — toggle system admin flag
-
-## Development
-
-```bash
-# Run the server (with hot reload via cargo-watch)
-cd server
-cargo watch -x run
-
-# Run the frontend dev server (proxies API to :8080)
-cd web
-npm run dev
-```
-
-### Running tests
-
-```bash
-cd server
-cargo test
-```
-
-42 tests covering the chat engine, IRC parser/formatter, JWT auth, and token hashing.
 
 ## License
 

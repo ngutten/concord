@@ -9,10 +9,15 @@ use uuid::Uuid;
 
 use super::channel::ChannelState;
 use super::events::{
-    ChannelInfo, ChatEvent, HistoryMessage, MemberInfo, ReactionGroup, ReplyInfo, ServerInfo,
-    SessionId,
+    AuditLogEntry, AutomodRuleInfo, BanInfo, BookmarkInfo, CategoryInfo, ChannelFollowInfo,
+    ChannelInfo, ChannelPositionInfo, ChatEvent, EventInfo, HistoryMessage, InviteInfo, MemberInfo,
+    PinnedMessageInfo, ReactionGroup, ReplyInfo, RoleInfo, RsvpInfo, ServerCommunityInfo,
+    ServerInfo, SessionId, TemplateInfo, ThreadInfo,
 };
-use super::permissions::ServerRole;
+use super::permissions::{
+    self, ChannelOverride, OverrideTargetType, Permissions, ServerRole, DEFAULT_ADMIN,
+    DEFAULT_EVERYONE, DEFAULT_MODERATOR,
+};
 use super::rate_limiter::RateLimiter;
 use super::server::ServerState;
 use super::user_session::{Protocol, UserSession};
@@ -22,6 +27,17 @@ use super::validation;
 /// that don't specify a server. No server with this ID is pre-created;
 /// IRC bare-channel operations will fail unless one is created by a user.
 pub const DEFAULT_SERVER_ID: &str = "default";
+
+/// Parameters for updating notification settings (avoids too-many-arguments).
+pub struct UpdateNotificationSettingsParams<'a> {
+    pub server_id: &'a str,
+    pub channel_id: Option<&'a str>,
+    pub level: &'a str,
+    pub suppress_everyone: bool,
+    pub suppress_roles: bool,
+    pub muted: bool,
+    pub mute_until: Option<&'a str>,
+}
 
 /// The central hub that manages all chat state. Protocol-agnostic —
 /// both IRC and WebSocket adapters call into this.
@@ -71,13 +87,52 @@ impl ChatEngine {
             .map_err(|e| format!("Failed to load servers: {e}"))?;
 
         for row in rows {
-            let mut state = ServerState::new(row.id.clone(), row.name, row.owner_id, row.icon_url);
+            let mut state = ServerState::new(row.id.clone(), row.name, row.owner_id.clone(), row.icon_url);
 
             let members = crate::db::queries::servers::get_server_members(pool, &row.id)
                 .await
                 .map_err(|e| format!("Failed to load server members: {e}"))?;
             for m in members {
                 state.member_user_ids.insert(m.user_id);
+            }
+
+            // Bootstrap default roles for servers that don't have any
+            if !crate::db::queries::roles::server_has_roles(pool, &row.id)
+                .await
+                .unwrap_or(true)
+            {
+                info!(server_id = %row.id, "bootstrapping default roles for existing server");
+                let default_roles = [
+                    ("@everyone", None, 0, DEFAULT_EVERYONE.bits() as i64, true),
+                    ("Moderator", None, 1, DEFAULT_MODERATOR.bits() as i64, false),
+                    ("Admin", None, 2, DEFAULT_ADMIN.bits() as i64, false),
+                    ("Owner", None, 3, Permissions::all().bits() as i64, false),
+                ];
+                let mut owner_role_id = None;
+                for (role_name, color, position, perms, is_default) in &default_roles {
+                    let role_id = Uuid::new_v4().to_string();
+                    let params = crate::db::queries::roles::CreateRoleParams {
+                        id: &role_id,
+                        server_id: &row.id,
+                        name: role_name,
+                        color: *color,
+                        icon_url: None,
+                        position: *position,
+                        permissions: *perms,
+                        is_default: *is_default,
+                    };
+                    let _ = crate::db::queries::roles::create_role(pool, &params).await;
+                    if *role_name == "Owner" {
+                        owner_role_id = Some(role_id);
+                    }
+                }
+                // Assign Owner role to the server owner
+                if let Some(role_id) = owner_role_id {
+                    let _ = crate::db::queries::roles::assign_role(
+                        pool, &row.id, &row.owner_id, &role_id,
+                    )
+                    .await;
+                }
             }
 
             self.servers.insert(row.id, state);
@@ -107,6 +162,13 @@ impl ChatEngine {
                     ChannelState::new(row.id.clone(), row.server_id.clone(), row.name.clone());
                 ch.topic = row.topic;
                 ch.topic_set_by = row.topic_set_by;
+                ch.category_id = row.category_id;
+                ch.position = row.position;
+                ch.is_private = row.is_private != 0;
+                ch.channel_type = row.channel_type;
+                ch.thread_parent_message_id = row.thread_parent_message_id;
+                ch.auto_archive_minutes = row.thread_auto_archive_minutes;
+                ch.archived = row.archived != 0;
 
                 self.channel_name_index
                     .insert((row.server_id.clone(), row.name), row.id.clone());
@@ -153,8 +215,20 @@ impl ChatEngine {
             avatar_url,
         ));
 
+        // Capture user_id before moving session into the map
+        let session_user_id = session.user_id.clone();
+
         self.sessions.insert(session_id, session);
         self.nick_to_session.insert(nickname.clone(), session_id);
+
+        // Update presence to online
+        if let (Some(uid), Some(pool)) = (&session_user_id, &self.db) {
+            let pool = pool.clone();
+            let uid = uid.clone();
+            tokio::spawn(async move {
+                let _ = crate::db::queries::presence::upsert_presence(&pool, &uid, "online", None, None).await;
+            });
+        }
 
         info!(%session_id, %nickname, ?protocol, "session connected");
 
@@ -194,6 +268,40 @@ impl ChatEngine {
             self.broadcast_to_channel(channel_id, &quit_event, Some(session_id));
         }
 
+        // Update presence if this was the last session for this user
+        if let Some(ref uid) = session.user_id {
+            let other_sessions = self.sessions.iter()
+                .any(|s| s.key() != &session_id && s.user_id.as_deref() == Some(uid));
+            if !other_sessions {
+                if let Some(pool) = &self.db {
+                    let _ = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(
+                            crate::db::queries::presence::set_offline(pool, uid)
+                        )
+                    });
+                }
+                // Broadcast offline to shared servers
+                for server in self.servers.iter() {
+                    if server.member_user_ids.contains(uid) {
+                        let event = ChatEvent::PresenceUpdate {
+                            server_id: server.id.clone(),
+                            presence: super::events::PresenceInfo {
+                                user_id: uid.clone(),
+                                nickname: session.nickname.clone(),
+                                avatar_url: session.avatar_url.clone(),
+                                status: "offline".into(),
+                                custom_status: None,
+                                status_emoji: None,
+                            },
+                        };
+                        for channel_id in server.channel_ids.iter() {
+                            self.broadcast_to_channel(channel_id, &event, Some(session_id));
+                        }
+                    }
+                }
+            }
+        }
+
         info!(%session_id, %nickname, "session disconnected");
     }
 
@@ -228,8 +336,60 @@ impl ChatEngine {
             owner_user_id.clone(),
             icon_url,
         );
-        state.member_user_ids.insert(owner_user_id);
+        state.member_user_ids.insert(owner_user_id.clone());
         self.servers.insert(server_id.clone(), state);
+
+        // Create default roles (@everyone, Moderator, Admin, Owner)
+        if let Some(pool) = &self.db {
+            let roles = [
+                ("@everyone", None, 0, DEFAULT_EVERYONE.bits() as i64, true),
+                (
+                    "Moderator",
+                    None,
+                    1,
+                    DEFAULT_MODERATOR.bits() as i64,
+                    false,
+                ),
+                ("Admin", None, 2, DEFAULT_ADMIN.bits() as i64, false),
+                (
+                    "Owner",
+                    None,
+                    3,
+                    Permissions::all().bits() as i64,
+                    false,
+                ),
+            ];
+            let mut owner_role_id = None;
+            for (role_name, color, position, perms, is_default) in &roles {
+                let role_id = Uuid::new_v4().to_string();
+                let params = crate::db::queries::roles::CreateRoleParams {
+                    id: &role_id,
+                    server_id: &server_id,
+                    name: role_name,
+                    color: *color,
+                    icon_url: None,
+                    position: *position,
+                    permissions: *perms,
+                    is_default: *is_default,
+                };
+                if let Err(e) = crate::db::queries::roles::create_role(pool, &params).await {
+                    warn!(error = %e, role = role_name, "failed to create default role");
+                }
+                if *role_name == "Owner" {
+                    owner_role_id = Some(role_id);
+                }
+            }
+            // Assign Owner role to the server creator
+            if let Some(role_id) = owner_role_id {
+                let _ = crate::db::queries::roles::assign_role(
+                    pool,
+                    &server_id,
+                    &owner_user_id,
+                    &role_id,
+                )
+                .await;
+            }
+        }
 
         // Create default #general channel
         let channel_id = Uuid::new_v4().to_string();
@@ -535,6 +695,10 @@ impl ChatEngine {
                     self.sessions.get(sid).map(|s| MemberInfo {
                         nickname: s.nickname.clone(),
                         avatar_url: s.avatar_url.clone(),
+                        status: None,
+                        custom_status: None,
+                        status_emoji: None,
+                        user_id: s.user_id.clone(),
                     })
                 })
                 .collect();
@@ -715,6 +879,7 @@ impl ChatEngine {
                 let ch = channel_id.clone();
                 let sid = session_id.to_string();
                 let nick = session.nickname.clone();
+                let uid = session.user_id.clone().unwrap_or_else(|| sid.clone());
                 let msg = content.to_string();
                 let reply_id = reply_to_id.map(|s| s.to_string());
                 let att_ids = attachment_ids.map(|ids| ids.to_vec());
@@ -733,11 +898,11 @@ impl ChatEngine {
                     {
                         error!(error = %e, "failed to persist message");
                     }
-                    // Link attachments to the message
+                    // Link attachments to the message (use user_id, not session_id)
                     if let Some(att_ids) = att_ids
                         && let Err(e) =
                             crate::db::queries::attachments::link_attachments_to_message(
-                                &pool, &id, &att_ids, &sid,
+                                &pool, &id, &att_ids, &uid,
                             )
                             .await
                     {
@@ -1049,6 +1214,12 @@ impl ChatEngine {
                 name: entry.name.clone(),
                 topic: entry.topic.clone(),
                 member_count: entry.member_count(),
+                category_id: entry.category_id.clone(),
+                position: entry.position,
+                is_private: entry.is_private,
+                channel_type: entry.channel_type.clone(),
+                thread_parent_message_id: entry.thread_parent_message_id.clone(),
+                archived: entry.archived,
             })
             .collect()
     }
@@ -1074,6 +1245,10 @@ impl ChatEngine {
                 self.sessions.get(sid).map(|s| MemberInfo {
                     nickname: s.nickname.clone(),
                     avatar_url: s.avatar_url.clone(),
+                    status: None,
+                    custom_status: None,
+                    status_emoji: None,
+                    user_id: s.user_id.clone(),
                 })
             })
             .collect())
@@ -1393,6 +1568,373 @@ impl ChatEngine {
             .collect())
     }
 
+    // ── Roles ────────────────────────────────────────────────────────
+
+    /// Get effective permissions for a user in a channel.
+    pub async fn get_effective_permissions(
+        &self,
+        server_id: &str,
+        channel_id: Option<&str>,
+        user_id: &str,
+    ) -> Permissions {
+        let is_owner = self.is_server_owner(server_id, user_id);
+        if is_owner {
+            return Permissions::all();
+        }
+
+        let Some(pool) = &self.db else {
+            return DEFAULT_EVERYONE;
+        };
+
+        // Get default (@everyone) role base permissions
+        let base = match crate::db::queries::roles::get_default_role(pool, server_id).await {
+            Ok(Some(role)) => Permissions::from_bits_truncate(role.permissions as u64),
+            _ => DEFAULT_EVERYONE,
+        };
+
+        // Get user's assigned roles
+        let user_roles = crate::db::queries::roles::get_user_roles(pool, server_id, user_id)
+            .await
+            .unwrap_or_default();
+        let role_perms: Vec<(String, Permissions)> = user_roles
+            .iter()
+            .map(|r| {
+                (
+                    r.id.clone(),
+                    Permissions::from_bits_truncate(r.permissions as u64),
+                )
+            })
+            .collect();
+
+        // Get channel overrides if a channel was specified
+        let overrides = if let Some(ch_id) = channel_id {
+            crate::db::queries::channels::get_channel_overrides(pool, ch_id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|o| ChannelOverride {
+                    target_type: if o.target_type == "role" {
+                        OverrideTargetType::Role
+                    } else {
+                        OverrideTargetType::User
+                    },
+                    target_id: o.target_id,
+                    allow: Permissions::from_bits_truncate(o.allow_bits as u64),
+                    deny: Permissions::from_bits_truncate(o.deny_bits as u64),
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+
+        // Get @everyone role id
+        let everyone_role_id = match crate::db::queries::roles::get_default_role(pool, server_id)
+            .await
+        {
+            Ok(Some(role)) => role.id,
+            _ => String::new(),
+        };
+
+        permissions::compute_effective_permissions(
+            base,
+            &role_perms,
+            &overrides,
+            &everyone_role_id,
+            user_id,
+            is_owner,
+        )
+    }
+
+    /// Check that a user has a required permission. Returns Ok(user_id) or Err(message).
+    pub async fn require_permission(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        channel_id: Option<&str>,
+        required: Permissions,
+    ) -> Result<String, String> {
+        let session = self
+            .sessions
+            .get(&session_id)
+            .ok_or("Session not found")?
+            .clone();
+        let user_id = session
+            .user_id
+            .as_deref()
+            .ok_or("AUTH_REQUIRED")?
+            .to_string();
+
+        let perms = self
+            .get_effective_permissions(server_id, channel_id, &user_id)
+            .await;
+
+        if perms.contains(required) {
+            Ok(user_id)
+        } else {
+            Err("FORBIDDEN: insufficient permissions".into())
+        }
+    }
+
+    /// List roles for a server.
+    pub async fn list_roles(&self, server_id: &str) -> Result<Vec<RoleInfo>, String> {
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+        let rows = crate::db::queries::roles::list_roles(pool, server_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+        Ok(rows.into_iter().map(role_row_to_info).collect())
+    }
+
+    /// Create a custom role in a server.
+    pub async fn create_role(
+        &self,
+        server_id: &str,
+        name: &str,
+        color: Option<&str>,
+        permissions: i64,
+    ) -> Result<RoleInfo, String> {
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+
+        // Determine position: max + 1
+        let existing = crate::db::queries::roles::list_roles(pool, server_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+        let max_pos = existing.iter().map(|r| r.position).max().unwrap_or(0);
+
+        let role_id = Uuid::new_v4().to_string();
+        let params = crate::db::queries::roles::CreateRoleParams {
+            id: &role_id,
+            server_id,
+            name,
+            color,
+            icon_url: None,
+            position: max_pos + 1,
+            permissions,
+            is_default: false,
+        };
+        crate::db::queries::roles::create_role(pool, &params)
+            .await
+            .map_err(|e| format!("Failed to create role: {e}"))?;
+
+        let role = crate::db::queries::roles::get_role(pool, &role_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?
+            .ok_or("Role not found after creation")?;
+
+        Ok(role_row_to_info(role))
+    }
+
+    /// Update a custom role.
+    pub async fn update_role(
+        &self,
+        role_id: &str,
+        name: &str,
+        color: Option<&str>,
+        permissions: i64,
+    ) -> Result<RoleInfo, String> {
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+        crate::db::queries::roles::update_role(pool, role_id, name, color, None, permissions)
+            .await
+            .map_err(|e| format!("Failed to update role: {e}"))?;
+        let role = crate::db::queries::roles::get_role(pool, role_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?
+            .ok_or("Role not found")?;
+        Ok(role_row_to_info(role))
+    }
+
+    /// Delete a custom role.
+    pub async fn delete_role(&self, role_id: &str) -> Result<(), String> {
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+        // Prevent deleting the @everyone default role
+        let role = crate::db::queries::roles::get_role(pool, role_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?
+            .ok_or("Role not found")?;
+        if role.is_default != 0 {
+            return Err("Cannot delete the default @everyone role".into());
+        }
+        crate::db::queries::roles::delete_role(pool, role_id)
+            .await
+            .map_err(|e| format!("Failed to delete role: {e}"))?;
+        Ok(())
+    }
+
+    /// Assign a role to a user.
+    pub async fn assign_role(
+        &self,
+        server_id: &str,
+        user_id: &str,
+        role_id: &str,
+    ) -> Result<Vec<String>, String> {
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+        crate::db::queries::roles::assign_role(pool, server_id, user_id, role_id)
+            .await
+            .map_err(|e| format!("Failed to assign role: {e}"))?;
+        let roles = crate::db::queries::roles::get_user_roles(pool, server_id, user_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+        Ok(roles.into_iter().map(|r| r.id).collect())
+    }
+
+    /// Remove a role from a user.
+    pub async fn remove_role(
+        &self,
+        server_id: &str,
+        user_id: &str,
+        role_id: &str,
+    ) -> Result<Vec<String>, String> {
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+        crate::db::queries::roles::remove_role(pool, server_id, user_id, role_id)
+            .await
+            .map_err(|e| format!("Failed to remove role: {e}"))?;
+        let roles = crate::db::queries::roles::get_user_roles(pool, server_id, user_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+        Ok(roles.into_iter().map(|r| r.id).collect())
+    }
+
+    // ── Categories ──────────────────────────────────────────────────
+
+    /// List categories for a server.
+    pub async fn list_categories(&self, server_id: &str) -> Result<Vec<CategoryInfo>, String> {
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+        let rows = crate::db::queries::categories::list_categories(pool, server_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+        Ok(rows.into_iter().map(category_row_to_info).collect())
+    }
+
+    /// Create a channel category.
+    pub async fn create_category(
+        &self,
+        server_id: &str,
+        name: &str,
+    ) -> Result<CategoryInfo, String> {
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+        let existing = crate::db::queries::categories::list_categories(pool, server_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+        let max_pos = existing.iter().map(|c| c.position).max().unwrap_or(-1);
+
+        let cat_id = Uuid::new_v4().to_string();
+        crate::db::queries::categories::create_category(
+            pool,
+            &cat_id,
+            server_id,
+            name,
+            max_pos + 1,
+        )
+        .await
+        .map_err(|e| format!("Failed to create category: {e}"))?;
+
+        Ok(CategoryInfo {
+            id: cat_id,
+            server_id: server_id.to_string(),
+            name: name.to_string(),
+            position: max_pos + 1,
+        })
+    }
+
+    /// Update a channel category name.
+    pub async fn update_category(
+        &self,
+        category_id: &str,
+        name: &str,
+    ) -> Result<CategoryInfo, String> {
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+        crate::db::queries::categories::update_category(pool, category_id, name)
+            .await
+            .map_err(|e| format!("Failed to update category: {e}"))?;
+        let cat = crate::db::queries::categories::get_category(pool, category_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?
+            .ok_or("Category not found")?;
+        Ok(category_row_to_info(cat))
+    }
+
+    /// Delete a channel category.
+    pub async fn delete_category(&self, category_id: &str) -> Result<(), String> {
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+        crate::db::queries::categories::delete_category(pool, category_id)
+            .await
+            .map_err(|e| format!("Failed to delete category: {e}"))?;
+        // Channels referencing this category get NULL (ON DELETE SET NULL)
+        // Update in-memory state
+        for mut ch in self.channels.iter_mut() {
+            if ch.category_id.as_deref() == Some(category_id) {
+                ch.category_id = None;
+            }
+        }
+        Ok(())
+    }
+
+    // ── Channel organization ────────────────────────────────────────
+
+    /// Reorder channels: update position and category for a batch of channels.
+    pub async fn reorder_channels(
+        &self,
+        _server_id: &str,
+        updates: &[ChannelPositionInfo],
+    ) -> Result<(), String> {
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+        for update in updates {
+            crate::db::queries::channels::update_channel_position(pool, &update.id, update.position)
+                .await
+                .map_err(|e| format!("Failed to update channel position: {e}"))?;
+            crate::db::queries::channels::update_channel_category(
+                pool,
+                &update.id,
+                update.category_id.as_deref(),
+            )
+            .await
+            .map_err(|e| format!("Failed to update channel category: {e}"))?;
+
+            // Update in-memory state
+            if let Some(mut ch) = self.channels.get_mut(&update.id) {
+                ch.position = update.position;
+                ch.category_id.clone_from(&update.category_id);
+            }
+        }
+        Ok(())
+    }
+
+    // ── Profiles ───────────────────────────────────────────────────
+
+    /// Get a user's full profile.
+    pub async fn get_user_profile(&self, user_id: &str) -> Result<super::events::UserProfileInfo, String> {
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+
+        // Get basic user info
+        let (id, username, _email, avatar_url) = crate::db::queries::users::get_user(pool, user_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?
+            .ok_or("User not found")?;
+
+        // Get profile
+        let profile = crate::db::queries::profiles::get_profile(pool, &id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+
+        // Get user created_at
+        let created_at = sqlx::query_scalar::<_, String>(
+            "SELECT created_at FROM users WHERE id = ?"
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|_| "unknown".into());
+
+        Ok(super::events::UserProfileInfo {
+            user_id: id,
+            username,
+            avatar_url,
+            bio: profile.as_ref().and_then(|p| p.bio.clone()),
+            pronouns: profile.as_ref().and_then(|p| p.pronouns.clone()),
+            banner_url: profile.as_ref().and_then(|p| p.banner_url.clone()),
+            created_at,
+        })
+    }
+
     // ── Utility ─────────────────────────────────────────────────────
 
     /// Get a reference to the database pool (if configured).
@@ -1443,6 +1985,2301 @@ impl ChatEngine {
                 warn!(%member_id, "failed to send event to session (channel closed)");
             }
         }
+    }
+
+    // ── Presence ─────────────────────────────────────────────
+
+    /// Update a user's presence and broadcast to members of shared servers.
+    pub async fn set_presence(
+        &self,
+        session_id: SessionId,
+        status: &str,
+        custom_status: Option<&str>,
+        status_emoji: Option<&str>,
+    ) -> Result<(), String> {
+        let session = self.get_session(session_id)
+            .ok_or("Session not found")?;
+        let user_id = session.user_id.clone()
+            .ok_or("Not authenticated")?;
+
+        // Validate status
+        match status {
+            "online" | "idle" | "dnd" | "invisible" => {}
+            _ => return Err("Invalid status. Must be: online, idle, dnd, invisible".into()),
+        }
+
+        // Persist to DB
+        if let Some(pool) = &self.db {
+            crate::db::queries::presence::upsert_presence(
+                pool, &user_id, status, custom_status, status_emoji,
+            )
+            .await
+            .map_err(|e| format!("Failed to update presence: {e}"))?;
+        }
+
+        // Build presence info
+        let presence = super::events::PresenceInfo {
+            user_id: user_id.clone(),
+            nickname: session.nickname.clone(),
+            avatar_url: session.avatar_url.clone(),
+            status: if status == "invisible" { "offline".into() } else { status.into() },
+            custom_status: custom_status.map(|s| s.to_string()),
+            status_emoji: status_emoji.map(|s| s.to_string()),
+        };
+
+        // Broadcast to all servers the user is a member of
+        for server in self.servers.iter() {
+            if server.member_user_ids.contains(&user_id) {
+                let event = ChatEvent::PresenceUpdate {
+                    server_id: server.id.clone(),
+                    presence: presence.clone(),
+                };
+                // Send to all sessions in this server's channels
+                for channel_id in server.channel_ids.iter() {
+                    if let Some(channel) = self.channels.get(channel_id) {
+                        for &member_sid in &channel.members {
+                            if member_sid != session_id && let Some(s) = self.sessions.get(&member_sid) {
+                                let _ = s.send(event.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get presence list for all members of a server.
+    pub async fn get_server_presences(&self, server_id: &str) -> Result<Vec<super::events::PresenceInfo>, String> {
+        let server = self.servers.get(server_id)
+            .ok_or(format!("Server not found: {server_id}"))?;
+
+        let user_ids: Vec<String> = server.member_user_ids.iter().cloned().collect();
+        drop(server);
+
+        let mut presences = Vec::new();
+
+        // Get DB presence records
+        if let Some(pool) = &self.db {
+            let rows = crate::db::queries::presence::get_presences_for_users(pool, &user_ids)
+                .await
+                .unwrap_or_default();
+
+            for row in rows {
+                // Find nickname for this user from active sessions
+                let (nickname, avatar_url) = self.find_user_display_info(&row.user_id);
+                let visible_status = if row.status == "invisible" { "offline".to_string() } else { row.status };
+                presences.push(super::events::PresenceInfo {
+                    user_id: row.user_id,
+                    nickname,
+                    avatar_url,
+                    status: visible_status,
+                    custom_status: row.custom_status,
+                    status_emoji: row.status_emoji,
+                });
+            }
+        }
+
+        // Add online users who may not have a presence row yet
+        for uid in &user_ids {
+            if !presences.iter().any(|p| p.user_id == *uid) {
+                let (nickname, avatar_url) = self.find_user_display_info(uid);
+                let is_online = self.sessions.iter().any(|s| s.user_id.as_deref() == Some(uid));
+                presences.push(super::events::PresenceInfo {
+                    user_id: uid.clone(),
+                    nickname,
+                    avatar_url,
+                    status: if is_online { "online".into() } else { "offline".into() },
+                    custom_status: None,
+                    status_emoji: None,
+                });
+            }
+        }
+
+        Ok(presences)
+    }
+
+    /// Find a user's display info (nickname, avatar) from active sessions or return defaults.
+    fn find_user_display_info(&self, user_id: &str) -> (String, Option<String>) {
+        for session in self.sessions.iter() {
+            if session.user_id.as_deref() == Some(user_id) {
+                return (session.nickname.clone(), session.avatar_url.clone());
+            }
+        }
+        (format!("user-{}", &user_id[..8.min(user_id.len())]), None)
+    }
+
+    // ── Server Nicknames ─────────────────────────────────────
+
+    /// Set a user's server-specific display name.
+    pub async fn set_server_nickname(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        nickname: Option<&str>,
+    ) -> Result<(), String> {
+        let session = self.get_session(session_id)
+            .ok_or("Session not found")?;
+        let user_id = session.user_id.clone()
+            .ok_or("Not authenticated")?;
+
+        // Verify membership
+        let server = self.servers.get(server_id)
+            .ok_or(format!("Server not found: {server_id}"))?;
+        if !server.member_user_ids.contains(&user_id) {
+            return Err("Not a member of this server".into());
+        }
+        drop(server);
+
+        if let Some(pool) = &self.db {
+            crate::db::queries::servers::set_server_nickname(pool, server_id, &user_id, nickname)
+                .await
+                .map_err(|e| format!("Failed to set nickname: {e}"))?;
+        }
+
+        // Broadcast nickname change
+        let event = ChatEvent::ServerNicknameUpdate {
+            server_id: server_id.to_string(),
+            user_id: user_id.clone(),
+            nickname: nickname.map(|s| s.to_string()),
+        };
+        if let Some(server) = self.servers.get(server_id) {
+            for channel_id in server.channel_ids.iter() {
+                self.broadcast_to_channel(channel_id, &event, None);
+            }
+        }
+
+        Ok(())
+    }
+
+    // ── Search ───────────────────────────────────────────────
+
+    /// Search messages in a server using full-text search.
+    pub async fn search_messages(
+        &self,
+        server_id: &str,
+        query: &str,
+        channel_name: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<super::events::SearchResultMessage>, i64), String> {
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+
+        // Resolve channel name to ID if provided
+        let channel_id = if let Some(ch_name) = channel_name {
+            Some(self.resolve_channel_id(server_id, ch_name)?)
+        } else {
+            None
+        };
+
+        let (rows, total) = crate::db::queries::search::search_messages(
+            pool, server_id, query, channel_id.as_deref(), limit.min(50), offset,
+        )
+        .await
+        .map_err(|e| format!("Search failed: {e}"))?;
+
+        let results: Vec<super::events::SearchResultMessage> = rows
+            .into_iter()
+            .filter_map(|row| {
+                let channel_name = row.channel_id.as_ref().and_then(|cid| {
+                    self.channels.get(cid).map(|ch| ch.name.clone())
+                }).unwrap_or_default();
+
+                Some(super::events::SearchResultMessage {
+                    id: row.id.parse().ok()?,
+                    from: row.sender_nick,
+                    content: row.content,
+                    timestamp: row.created_at.parse().ok()?,
+                    channel_id: row.channel_id.unwrap_or_default(),
+                    channel_name,
+                    edited_at: row.edited_at.as_ref().and_then(|s| s.parse().ok()),
+                })
+            })
+            .collect();
+
+        Ok((results, total))
+    }
+
+    // ── Notification Settings ────────────────────────────────
+
+    /// Update notification settings for a user in a server or channel.
+    pub async fn update_notification_settings(
+        &self,
+        session_id: SessionId,
+        params: &UpdateNotificationSettingsParams<'_>,
+    ) -> Result<(), String> {
+        let session = self.get_session(session_id)
+            .ok_or("Session not found")?;
+        let user_id = session.user_id.clone()
+            .ok_or("Not authenticated")?;
+
+        match params.level {
+            "all" | "mentions" | "none" | "default" => {}
+            _ => return Err("Invalid level. Must be: all, mentions, none, default".into()),
+        }
+
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+        let id = Uuid::new_v4().to_string();
+
+        let db_params = crate::db::models::UpsertNotificationParams {
+            id: &id,
+            user_id: &user_id,
+            server_id: Some(params.server_id),
+            channel_id: params.channel_id,
+            level: params.level,
+            suppress_everyone: params.suppress_everyone,
+            suppress_roles: params.suppress_roles,
+            muted: params.muted,
+            mute_until: params.mute_until,
+        };
+        crate::db::queries::notifications::upsert_notification_setting(pool, &db_params)
+        .await
+        .map_err(|e| format!("Failed to update notification settings: {e}"))?;
+
+        Ok(())
+    }
+
+    /// Get notification settings for a user in a server.
+    pub async fn get_notification_settings(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+    ) -> Result<Vec<super::events::NotificationSettingInfo>, String> {
+        let session = self.get_session(session_id)
+            .ok_or("Session not found")?;
+        let user_id = session.user_id.clone()
+            .ok_or("Not authenticated")?;
+
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+
+        let rows = crate::db::queries::notifications::get_notification_settings(pool, &user_id, server_id)
+            .await
+            .map_err(|e| format!("Failed to get notification settings: {e}"))?;
+
+        Ok(rows.into_iter().map(|r| super::events::NotificationSettingInfo {
+            id: r.id,
+            server_id: r.server_id,
+            channel_id: r.channel_id,
+            level: r.level,
+            suppress_everyone: r.suppress_everyone != 0,
+            suppress_roles: r.suppress_roles != 0,
+            muted: r.muted != 0,
+            mute_until: r.mute_until,
+        }).collect())
+    }
+
+    // ── Pinning ─────────────────────────────────────────────────
+
+    /// Pin a message in a channel. Requires MANAGE_MESSAGES permission or ownership of the message.
+    pub async fn pin_message(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        channel_name: &str,
+        message_id: &str,
+    ) -> Result<(), String> {
+        let session = self.get_session(session_id).ok_or("Session not found")?;
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+
+        let channel_name = normalize_channel_name(channel_name);
+        let channel_id = self.resolve_channel_id(server_id, &channel_name)?;
+
+        // Look up the message
+        let msg = crate::db::queries::messages::get_message_by_id(pool, message_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?
+            .ok_or("Message not found")?;
+
+        // Check permission: MANAGE_MESSAGES or own message
+        let user_id = session.user_id.as_deref().ok_or("AUTH_REQUIRED")?;
+        let is_own = msg.sender_id == user_id || msg.sender_nick == session.nickname;
+        if !is_own {
+            let perms = self
+                .get_effective_permissions(server_id, Some(&channel_id), user_id)
+                .await;
+            if !perms.contains(Permissions::MANAGE_MESSAGES) {
+                return Err("FORBIDDEN: insufficient permissions to pin messages".into());
+            }
+        }
+
+        // Check pin count limit (max 50 per channel)
+        let pin_count = crate::db::queries::pins::count_pins(pool, &channel_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+        if pin_count >= 50 {
+            return Err("Channel has reached the maximum of 50 pinned messages".into());
+        }
+
+        let pin_id = Uuid::new_v4().to_string();
+        crate::db::queries::pins::pin_message(pool, &pin_id, &channel_id, message_id, user_id)
+            .await
+            .map_err(|e| format!("Failed to pin message: {e}"))?;
+
+        let pin = PinnedMessageInfo {
+            id: pin_id,
+            message_id: message_id.to_string(),
+            channel_id: channel_id.clone(),
+            pinned_by: user_id.to_string(),
+            pinned_at: Utc::now().to_rfc3339(),
+            from: msg.sender_nick,
+            content: msg.content,
+            timestamp: msg.created_at,
+        };
+
+        let event = ChatEvent::MessagePin {
+            server_id: server_id.to_string(),
+            channel: channel_name,
+            pin,
+        };
+        self.broadcast_to_channel(&channel_id, &event, None);
+
+        Ok(())
+    }
+
+    /// Unpin a message from a channel. Requires MANAGE_MESSAGES permission.
+    pub async fn unpin_message(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        channel_name: &str,
+        message_id: &str,
+    ) -> Result<(), String> {
+        let channel_name = normalize_channel_name(channel_name);
+        let channel_id = self.resolve_channel_id(server_id, &channel_name)?;
+
+        self.require_permission(
+            session_id,
+            server_id,
+            Some(&channel_id),
+            Permissions::MANAGE_MESSAGES,
+        )
+        .await?;
+
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+
+        crate::db::queries::pins::unpin_message(pool, &channel_id, message_id)
+            .await
+            .map_err(|e| format!("Failed to unpin message: {e}"))?;
+
+        let event = ChatEvent::MessageUnpin {
+            server_id: server_id.to_string(),
+            channel: channel_name,
+            message_id: message_id.to_string(),
+        };
+        self.broadcast_to_channel(&channel_id, &event, None);
+
+        Ok(())
+    }
+
+    /// Get all pinned messages in a channel. Sends PinnedMessages event to the requesting session.
+    pub async fn get_pinned_messages(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        channel_name: &str,
+    ) -> Result<(), String> {
+        let session = self.get_session(session_id).ok_or("Session not found")?;
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+
+        let channel_name = normalize_channel_name(channel_name);
+        let channel_id = self.resolve_channel_id(server_id, &channel_name)?;
+
+        let pin_rows = crate::db::queries::pins::get_pinned_messages(pool, &channel_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+
+        let mut pins = Vec::new();
+        for row in pin_rows {
+            // Look up message content for each pin
+            let (from, content, timestamp) =
+                match crate::db::queries::messages::get_message_by_id(pool, &row.message_id).await {
+                    Ok(Some(msg)) => (msg.sender_nick, msg.content, msg.created_at),
+                    _ => ("unknown".to_string(), "[deleted]".to_string(), String::new()),
+                };
+
+            pins.push(PinnedMessageInfo {
+                id: row.id,
+                message_id: row.message_id,
+                channel_id: row.channel_id,
+                pinned_by: row.pinned_by,
+                pinned_at: row.pinned_at,
+                from,
+                content,
+                timestamp,
+            });
+        }
+
+        let _ = session.send(ChatEvent::PinnedMessages {
+            server_id: server_id.to_string(),
+            channel: channel_name,
+            pins,
+        });
+
+        Ok(())
+    }
+
+    // ── Threads ─────────────────────────────────────────────────
+
+    /// Create a thread from a message in a channel.
+    pub async fn create_thread(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        parent_channel_name: &str,
+        name: &str,
+        message_id: &str,
+        is_private: bool,
+    ) -> Result<(), String> {
+        let session = self.get_session(session_id).ok_or("Session not found")?;
+        let _user_id = session.user_id.as_deref().ok_or("AUTH_REQUIRED")?;
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+
+        let parent_channel_name = normalize_channel_name(parent_channel_name);
+        let parent_channel_id = self.resolve_channel_id(server_id, &parent_channel_name)?;
+
+        // Validate thread name
+        if name.is_empty() || name.len() > 100 {
+            return Err("Thread name must be between 1 and 100 characters".into());
+        }
+
+        let channel_type = if is_private {
+            "private_thread"
+        } else {
+            "public_thread"
+        };
+
+        let thread_id = Uuid::new_v4().to_string();
+        let thread_name = normalize_channel_name(name);
+
+        // Check name uniqueness within server
+        if self
+            .channel_name_index
+            .contains_key(&(server_id.to_string(), thread_name.clone()))
+        {
+            return Err(format!("A channel or thread named {thread_name} already exists"));
+        }
+
+        crate::db::queries::threads::create_thread(
+            pool,
+            &thread_id,
+            server_id,
+            &thread_name,
+            channel_type,
+            message_id,
+            1440, // default auto-archive: 24h
+        )
+        .await
+        .map_err(|e| format!("Failed to create thread: {e}"))?;
+
+        // Add to in-memory state
+        let mut ch = ChannelState::new(thread_id.clone(), server_id.to_string(), thread_name.clone());
+        ch.channel_type = channel_type.to_string();
+        ch.thread_parent_message_id = Some(message_id.to_string());
+        ch.auto_archive_minutes = 1440;
+        ch.is_private = is_private;
+
+        self.channel_name_index
+            .insert((server_id.to_string(), thread_name.clone()), thread_id.clone());
+        if let Some(mut srv) = self.servers.get_mut(server_id) {
+            srv.channel_ids.insert(thread_id.clone());
+        }
+        self.channels.insert(thread_id.clone(), ch);
+
+        let thread_info = ThreadInfo {
+            id: thread_id,
+            name: thread_name,
+            channel_type: channel_type.to_string(),
+            parent_message_id: Some(message_id.to_string()),
+            archived: false,
+            auto_archive_minutes: 1440,
+            message_count: 0,
+            created_at: Utc::now().to_rfc3339(),
+        };
+
+        let event = ChatEvent::ThreadCreate {
+            server_id: server_id.to_string(),
+            parent_channel: parent_channel_name,
+            thread: thread_info,
+        };
+        self.broadcast_to_channel(&parent_channel_id, &event, None);
+
+        Ok(())
+    }
+
+    /// Archive a thread. Requires MANAGE_CHANNELS permission.
+    pub async fn archive_thread(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        thread_id: &str,
+    ) -> Result<(), String> {
+        self.require_permission(
+            session_id,
+            server_id,
+            Some(thread_id),
+            Permissions::MANAGE_CHANNELS,
+        )
+        .await?;
+
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+
+        crate::db::queries::threads::archive_thread(pool, thread_id)
+            .await
+            .map_err(|e| format!("Failed to archive thread: {e}"))?;
+
+        // Update in-memory state
+        let thread_info = if let Some(mut ch) = self.channels.get_mut(thread_id) {
+            ch.archived = true;
+            ThreadInfo {
+                id: ch.id.clone(),
+                name: ch.name.clone(),
+                channel_type: ch.channel_type.clone(),
+                parent_message_id: ch.thread_parent_message_id.clone(),
+                archived: true,
+                auto_archive_minutes: ch.auto_archive_minutes,
+                message_count: 0, // not tracked in-memory
+                created_at: ch.created_at.to_rfc3339(),
+            }
+        } else {
+            return Err("Thread not found".into());
+        };
+
+        let event = ChatEvent::ThreadUpdate {
+            server_id: server_id.to_string(),
+            thread: thread_info,
+        };
+        self.broadcast_to_channel(thread_id, &event, None);
+
+        Ok(())
+    }
+
+    /// List threads for a channel. Sends ThreadList event to the requesting session.
+    pub async fn list_threads(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        channel_name: &str,
+    ) -> Result<(), String> {
+        let session = self.get_session(session_id).ok_or("Session not found")?;
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+
+        let channel_name = normalize_channel_name(channel_name);
+        let channel_id = self.resolve_channel_id(server_id, &channel_name)?;
+
+        let rows = crate::db::queries::threads::get_threads_for_channel(pool, &channel_id, server_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+
+        let threads: Vec<ThreadInfo> = rows
+            .into_iter()
+            .map(|row| ThreadInfo {
+                id: row.id,
+                name: row.name,
+                channel_type: row.channel_type,
+                parent_message_id: row.thread_parent_message_id,
+                archived: row.archived != 0,
+                auto_archive_minutes: row.thread_auto_archive_minutes,
+                message_count: 0, // would need a count query; returning 0 for now
+                created_at: row.created_at,
+            })
+            .collect();
+
+        let _ = session.send(ChatEvent::ThreadList {
+            server_id: server_id.to_string(),
+            channel: channel_name,
+            threads,
+        });
+
+        Ok(())
+    }
+
+    // ── Bookmarks ───────────────────────────────────────────────
+
+    /// Add a bookmark on a message for the authenticated user.
+    pub async fn add_bookmark(
+        &self,
+        session_id: SessionId,
+        message_id: &str,
+        note: Option<&str>,
+    ) -> Result<(), String> {
+        let session = self.get_session(session_id).ok_or("Session not found")?;
+        let user_id = session.user_id.as_deref().ok_or("AUTH_REQUIRED")?;
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+
+        // Look up the message for BookmarkInfo
+        let msg = crate::db::queries::messages::get_message_by_id(pool, message_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?
+            .ok_or("Message not found")?;
+
+        let bookmark_id = Uuid::new_v4().to_string();
+        crate::db::queries::bookmarks::add_bookmark(pool, &bookmark_id, user_id, message_id, note)
+            .await
+            .map_err(|e| format!("Failed to add bookmark: {e}"))?;
+
+        let bookmark = BookmarkInfo {
+            id: bookmark_id,
+            message_id: message_id.to_string(),
+            channel_id: msg.channel_id.unwrap_or_default(),
+            from: msg.sender_nick,
+            content: msg.content,
+            timestamp: msg.created_at,
+            note: note.map(|s| s.to_string()),
+            created_at: Utc::now().to_rfc3339(),
+        };
+
+        let _ = session.send(ChatEvent::BookmarkAdd { bookmark });
+
+        Ok(())
+    }
+
+    /// Remove a bookmark for the authenticated user.
+    pub async fn remove_bookmark(
+        &self,
+        session_id: SessionId,
+        message_id: &str,
+    ) -> Result<(), String> {
+        let session = self.get_session(session_id).ok_or("Session not found")?;
+        let user_id = session.user_id.as_deref().ok_or("AUTH_REQUIRED")?;
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+
+        crate::db::queries::bookmarks::remove_bookmark(pool, user_id, message_id)
+            .await
+            .map_err(|e| format!("Failed to remove bookmark: {e}"))?;
+
+        let _ = session.send(ChatEvent::BookmarkRemove {
+            message_id: message_id.to_string(),
+        });
+
+        Ok(())
+    }
+
+    /// List all bookmarks for the authenticated user. Sends BookmarkList event to the session.
+    pub async fn list_bookmarks(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(), String> {
+        let session = self.get_session(session_id).ok_or("Session not found")?;
+        let user_id = session.user_id.as_deref().ok_or("AUTH_REQUIRED")?;
+        let pool = self.db.as_ref().ok_or("No database configured")?;
+
+        let rows = crate::db::queries::bookmarks::list_bookmarks(pool, user_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+
+        let mut bookmarks = Vec::new();
+        for row in rows {
+            // Look up message content for each bookmark
+            let (from, content, timestamp, channel_id) =
+                match crate::db::queries::messages::get_message_by_id(pool, &row.message_id).await {
+                    Ok(Some(msg)) => (
+                        msg.sender_nick,
+                        msg.content,
+                        msg.created_at,
+                        msg.channel_id.unwrap_or_default(),
+                    ),
+                    _ => (
+                        "unknown".to_string(),
+                        "[deleted]".to_string(),
+                        String::new(),
+                        String::new(),
+                    ),
+                };
+
+            bookmarks.push(BookmarkInfo {
+                id: row.id,
+                message_id: row.message_id,
+                channel_id,
+                from,
+                content,
+                timestamp,
+                note: row.note,
+                created_at: row.created_at,
+            });
+        }
+
+        let _ = session.send(ChatEvent::BookmarkList { bookmarks });
+
+        Ok(())
+    }
+
+    // ── Phase 6: Moderation ─────────────────────────────────────
+
+    /// Broadcast a ChatEvent to all connected sessions that belong to a server.
+    fn broadcast_to_server(&self, server_id: &str, event: &ChatEvent) {
+        let Some(server) = self.servers.get(server_id) else {
+            return;
+        };
+        let member_ids: Vec<String> = server.member_user_ids.iter().cloned().collect();
+        drop(server);
+
+        for session in self.sessions.iter() {
+            if let Some(uid) = &session.user_id
+                && member_ids.contains(uid)
+            {
+                let _ = session.send(event.clone());
+            }
+        }
+    }
+
+    /// Kick a member from a server.
+    pub async fn kick_member(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        target_user_id: &str,
+        reason: Option<&str>,
+    ) -> Result<(), String> {
+        let actor_id = self
+            .require_permission(session_id, server_id, None, Permissions::KICK_MEMBERS)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        crate::db::queries::moderation::kick_member(pool, server_id, target_user_id)
+            .await
+            .map_err(|e| format!("Failed to kick member: {e}"))?;
+
+        // Remove from in-memory server state
+        if let Some(mut server) = self.servers.get_mut(server_id) {
+            server.member_user_ids.remove(target_user_id);
+        }
+
+        // Log to audit log
+        let audit_id = Uuid::new_v4().to_string();
+        let _ = crate::db::queries::audit_log::create_entry(
+            pool,
+            &crate::db::models::CreateAuditLogParams {
+                id: &audit_id,
+                server_id,
+                actor_id: &actor_id,
+                action_type: "member_kick",
+                target_type: Some("user"),
+                target_id: Some(target_user_id),
+                reason,
+                changes: None,
+            },
+        )
+        .await;
+
+        // Broadcast kick event to server members
+        let event = ChatEvent::MemberKick {
+            server_id: server_id.to_string(),
+            user_id: target_user_id.to_string(),
+            kicked_by: actor_id,
+            reason: reason.map(String::from),
+        };
+        self.broadcast_to_server(server_id, &event);
+
+        Ok(())
+    }
+
+    /// Ban a member from a server, optionally deleting their messages.
+    pub async fn ban_member(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        target_user_id: &str,
+        reason: Option<&str>,
+        delete_message_days: i32,
+    ) -> Result<(), String> {
+        let actor_id = self
+            .require_permission(session_id, server_id, None, Permissions::BAN_MEMBERS)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        let ban_id = Uuid::new_v4().to_string();
+        let days = delete_message_days.clamp(0, 7);
+
+        crate::db::queries::bans::create_ban(
+            pool,
+            &ban_id,
+            server_id,
+            target_user_id,
+            &actor_id,
+            reason,
+            days,
+        )
+        .await
+        .map_err(|e| format!("Failed to ban member: {e}"))?;
+
+        // Also kick them from the server
+        let _ =
+            crate::db::queries::moderation::kick_member(pool, server_id, target_user_id).await;
+
+        // Delete messages if requested
+        if days > 0 {
+            let _ = crate::db::queries::moderation::delete_user_messages(
+                pool,
+                server_id,
+                target_user_id,
+                days,
+            )
+            .await;
+        }
+
+        // Remove from in-memory server state
+        if let Some(mut server) = self.servers.get_mut(server_id) {
+            server.member_user_ids.remove(target_user_id);
+        }
+
+        // Audit log
+        let audit_id = Uuid::new_v4().to_string();
+        let _ = crate::db::queries::audit_log::create_entry(
+            pool,
+            &crate::db::models::CreateAuditLogParams {
+                id: &audit_id,
+                server_id,
+                actor_id: &actor_id,
+                action_type: "member_ban",
+                target_type: Some("user"),
+                target_id: Some(target_user_id),
+                reason,
+                changes: None,
+            },
+        )
+        .await;
+
+        // Broadcast
+        let event = ChatEvent::MemberBan {
+            server_id: server_id.to_string(),
+            user_id: target_user_id.to_string(),
+            banned_by: actor_id,
+            reason: reason.map(String::from),
+        };
+        self.broadcast_to_server(server_id, &event);
+
+        Ok(())
+    }
+
+    /// Unban a member from a server.
+    pub async fn unban_member(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        target_user_id: &str,
+    ) -> Result<(), String> {
+        let actor_id = self
+            .require_permission(session_id, server_id, None, Permissions::BAN_MEMBERS)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        let removed = crate::db::queries::bans::remove_ban(pool, server_id, target_user_id)
+            .await
+            .map_err(|e| format!("Failed to unban member: {e}"))?;
+
+        if !removed {
+            return Err("User is not banned".into());
+        }
+
+        // Audit log
+        let audit_id = Uuid::new_v4().to_string();
+        let _ = crate::db::queries::audit_log::create_entry(
+            pool,
+            &crate::db::models::CreateAuditLogParams {
+                id: &audit_id,
+                server_id,
+                actor_id: &actor_id,
+                action_type: "member_unban",
+                target_type: Some("user"),
+                target_id: Some(target_user_id),
+                reason: None,
+                changes: None,
+            },
+        )
+        .await;
+
+        // Broadcast
+        let event = ChatEvent::MemberUnban {
+            server_id: server_id.to_string(),
+            user_id: target_user_id.to_string(),
+        };
+        self.broadcast_to_server(server_id, &event);
+
+        Ok(())
+    }
+
+    /// Get the list of bans for a server.
+    pub async fn list_bans(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+    ) -> Result<(), String> {
+        self.require_permission(session_id, server_id, None, Permissions::BAN_MEMBERS)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        let rows = crate::db::queries::bans::list_bans(pool, server_id)
+            .await
+            .map_err(|e| format!("Failed to list bans: {e}"))?;
+
+        let bans: Vec<BanInfo> = rows
+            .into_iter()
+            .map(|r| BanInfo {
+                id: r.id,
+                user_id: r.user_id,
+                banned_by: r.banned_by,
+                reason: r.reason,
+                created_at: r.created_at,
+            })
+            .collect();
+
+        if let Some(session) = self.get_session(session_id) {
+            let _ = session.send(ChatEvent::BanList {
+                server_id: server_id.to_string(),
+                bans,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Set a timeout on a member (or clear it).
+    pub async fn timeout_member(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        target_user_id: &str,
+        timeout_until: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<(), String> {
+        let actor_id = self
+            .require_permission(session_id, server_id, None, Permissions::KICK_MEMBERS)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        crate::db::queries::moderation::set_member_timeout(
+            pool,
+            server_id,
+            target_user_id,
+            timeout_until,
+        )
+        .await
+        .map_err(|e| format!("Failed to set timeout: {e}"))?;
+
+        // Audit log
+        let audit_id = Uuid::new_v4().to_string();
+        let changes_json = timeout_until
+            .map(|t| format!("{{\"timeout_until\":\"{t}\"}}"));
+        let _ = crate::db::queries::audit_log::create_entry(
+            pool,
+            &crate::db::models::CreateAuditLogParams {
+                id: &audit_id,
+                server_id,
+                actor_id: &actor_id,
+                action_type: "member_timeout",
+                target_type: Some("user"),
+                target_id: Some(target_user_id),
+                reason,
+                changes: changes_json.as_deref(),
+            },
+        )
+        .await;
+
+        // Broadcast
+        let event = ChatEvent::MemberTimeout {
+            server_id: server_id.to_string(),
+            user_id: target_user_id.to_string(),
+            timeout_until: timeout_until.map(String::from),
+        };
+        self.broadcast_to_server(server_id, &event);
+
+        Ok(())
+    }
+
+    /// Set slow mode on a channel.
+    pub async fn set_slowmode(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        channel_name: &str,
+        seconds: i32,
+    ) -> Result<(), String> {
+        self.require_permission(session_id, server_id, None, Permissions::MANAGE_CHANNELS)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        let channel_id = self
+            .channel_name_index
+            .get(&(server_id.to_string(), channel_name.to_string()))
+            .map(|v| v.clone())
+            .ok_or_else(|| "Channel not found".to_string())?;
+
+        let seconds = seconds.clamp(0, 21600); // max 6 hours
+
+        crate::db::queries::moderation::set_slowmode(pool, &channel_id, seconds)
+            .await
+            .map_err(|e| format!("Failed to set slow mode: {e}"))?;
+
+        // Broadcast
+        let event = ChatEvent::SlowModeUpdate {
+            server_id: server_id.to_string(),
+            channel: channel_name.to_string(),
+            seconds,
+        };
+        self.broadcast_to_server(server_id, &event);
+
+        Ok(())
+    }
+
+    /// Set NSFW flag on a channel.
+    pub async fn set_nsfw(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        channel_name: &str,
+        is_nsfw: bool,
+    ) -> Result<(), String> {
+        self.require_permission(session_id, server_id, None, Permissions::MANAGE_CHANNELS)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        let channel_id = self
+            .channel_name_index
+            .get(&(server_id.to_string(), channel_name.to_string()))
+            .map(|v| v.clone())
+            .ok_or_else(|| "Channel not found".to_string())?;
+
+        crate::db::queries::moderation::set_nsfw(pool, &channel_id, is_nsfw)
+            .await
+            .map_err(|e| format!("Failed to set NSFW: {e}"))?;
+
+        // Broadcast
+        let event = ChatEvent::NsfwUpdate {
+            server_id: server_id.to_string(),
+            channel: channel_name.to_string(),
+            is_nsfw,
+        };
+        self.broadcast_to_server(server_id, &event);
+
+        Ok(())
+    }
+
+    /// Bulk delete messages in a channel (up to 100).
+    pub async fn bulk_delete_messages(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        channel_name: &str,
+        message_ids: Vec<String>,
+    ) -> Result<(), String> {
+        self.require_permission(session_id, server_id, None, Permissions::MANAGE_MESSAGES)
+            .await?;
+
+        if message_ids.is_empty() {
+            return Err("No messages to delete".into());
+        }
+        if message_ids.len() > 100 {
+            return Err("Cannot bulk delete more than 100 messages".into());
+        }
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        crate::db::queries::moderation::bulk_delete_messages(pool, &message_ids)
+            .await
+            .map_err(|e| format!("Failed to bulk delete: {e}"))?;
+
+        // Broadcast
+        let event = ChatEvent::BulkMessageDelete {
+            server_id: server_id.to_string(),
+            channel: channel_name.to_string(),
+            message_ids,
+        };
+        self.broadcast_to_server(server_id, &event);
+
+        Ok(())
+    }
+
+    /// Get audit log entries for a server.
+    pub async fn get_audit_log(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        action_type: Option<&str>,
+        limit: i64,
+        before: Option<&str>,
+    ) -> Result<(), String> {
+        self.require_permission(session_id, server_id, None, Permissions::MANAGE_SERVER)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        let limit = limit.clamp(1, 100);
+        let rows = crate::db::queries::audit_log::list_entries(
+            pool,
+            server_id,
+            action_type,
+            limit,
+            before,
+        )
+        .await
+        .map_err(|e| format!("Failed to get audit log: {e}"))?;
+
+        let entries: Vec<AuditLogEntry> = rows
+            .into_iter()
+            .map(|r| AuditLogEntry {
+                id: r.id,
+                actor_id: r.actor_id,
+                action_type: r.action_type,
+                target_type: r.target_type,
+                target_id: r.target_id,
+                reason: r.reason,
+                changes: r.changes,
+                created_at: r.created_at,
+            })
+            .collect();
+
+        if let Some(session) = self.get_session(session_id) {
+            let _ = session.send(ChatEvent::AuditLogEntries {
+                server_id: server_id.to_string(),
+                entries,
+            });
+        }
+
+        Ok(())
+    }
+
+    // ── AutoMod ──
+
+    /// Create an automod rule.
+    pub async fn create_automod_rule(
+        &self,
+        session_id: SessionId,
+        params: &crate::db::models::CreateAutomodRuleParams<'_>,
+    ) -> Result<(), String> {
+        let server_id = params.server_id;
+        let name = params.name;
+        let rule_type = params.rule_type;
+        let config = params.config;
+        let action_type = params.action_type;
+        let timeout_duration_seconds = params.timeout_duration_seconds;
+        self.require_permission(session_id, server_id, None, Permissions::MANAGE_SERVER)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        // Validate rule_type
+        if !["keyword", "mention_spam", "link_filter"].contains(&rule_type) {
+            return Err(
+                "Invalid rule type. Must be 'keyword', 'mention_spam', or 'link_filter'".into(),
+            );
+        }
+        // Validate action_type
+        if !["delete", "timeout", "flag"].contains(&action_type) {
+            return Err(
+                "Invalid action type. Must be 'delete', 'timeout', or 'flag'".into(),
+            );
+        }
+
+        let rule_id = Uuid::new_v4().to_string();
+        let db_params = crate::db::models::CreateAutomodRuleParams {
+            id: &rule_id,
+            server_id,
+            name,
+            rule_type,
+            config,
+            action_type,
+            timeout_duration_seconds,
+        };
+        crate::db::queries::automod::create_rule(pool, &db_params)
+            .await
+            .map_err(|e| format!("Failed to create automod rule: {e}"))?;
+
+        let rule = AutomodRuleInfo {
+            id: rule_id,
+            name: name.to_string(),
+            enabled: true,
+            rule_type: rule_type.to_string(),
+            config: config.to_string(),
+            action_type: action_type.to_string(),
+            timeout_duration_seconds,
+        };
+
+        if let Some(session) = self.get_session(session_id) {
+            let _ = session.send(ChatEvent::AutomodRuleUpdate {
+                server_id: server_id.to_string(),
+                rule,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Update an automod rule.
+    pub async fn update_automod_rule(
+        &self,
+        session_id: SessionId,
+        params: &crate::db::models::UpdateAutomodRuleParams<'_>,
+    ) -> Result<(), String> {
+        let server_id = params.server_id;
+        let rule_id = params.rule_id;
+        let name = params.name;
+        let enabled = params.enabled;
+        let config = params.config;
+        let action_type = params.action_type;
+        let timeout_duration_seconds = params.timeout_duration_seconds;
+
+        self.require_permission(session_id, server_id, None, Permissions::MANAGE_SERVER)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        crate::db::queries::automod::update_rule(
+            pool,
+            rule_id,
+            name,
+            enabled,
+            config,
+            action_type,
+            timeout_duration_seconds,
+        )
+        .await
+        .map_err(|e| format!("Failed to update automod rule: {e}"))?;
+
+        let rule = AutomodRuleInfo {
+            id: rule_id.to_string(),
+            name: name.to_string(),
+            enabled,
+            rule_type: String::new(), // caller doesn't change rule_type
+            config: config.to_string(),
+            action_type: action_type.to_string(),
+            timeout_duration_seconds,
+        };
+
+        if let Some(session) = self.get_session(session_id) {
+            let _ = session.send(ChatEvent::AutomodRuleUpdate {
+                server_id: server_id.to_string(),
+                rule,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Delete an automod rule.
+    pub async fn delete_automod_rule(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        rule_id: &str,
+    ) -> Result<(), String> {
+        self.require_permission(session_id, server_id, None, Permissions::MANAGE_SERVER)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        crate::db::queries::automod::delete_rule(pool, rule_id)
+            .await
+            .map_err(|e| format!("Failed to delete automod rule: {e}"))?;
+
+        if let Some(session) = self.get_session(session_id) {
+            let _ = session.send(ChatEvent::AutomodRuleDelete {
+                server_id: server_id.to_string(),
+                rule_id: rule_id.to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// List automod rules for a server.
+    pub async fn list_automod_rules(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+    ) -> Result<(), String> {
+        self.require_permission(session_id, server_id, None, Permissions::MANAGE_SERVER)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        let rows = crate::db::queries::automod::list_rules(pool, server_id)
+            .await
+            .map_err(|e| format!("Failed to list automod rules: {e}"))?;
+
+        let rules: Vec<AutomodRuleInfo> = rows
+            .into_iter()
+            .map(|r| AutomodRuleInfo {
+                id: r.id,
+                name: r.name,
+                enabled: r.enabled != 0,
+                rule_type: r.rule_type,
+                config: r.config,
+                action_type: r.action_type,
+                timeout_duration_seconds: r.timeout_duration_seconds,
+            })
+            .collect();
+
+        if let Some(session) = self.get_session(session_id) {
+            let _ = session.send(ChatEvent::AutomodRuleList {
+                server_id: server_id.to_string(),
+                rules,
+            });
+        }
+
+        Ok(())
+    }
+
+    // ── Phase 7: Community & Discovery ─────────────────────────────
+
+    // ── Invites ──
+
+    /// Create a server invite. Requires CREATE_INVITES permission.
+    pub async fn create_invite(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        max_uses: Option<i32>,
+        expires_at: Option<&str>,
+        channel_id: Option<&str>,
+    ) -> Result<(), String> {
+        let user_id = self
+            .require_permission(session_id, server_id, None, Permissions::CREATE_INVITES)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        let invite_id = Uuid::new_v4().to_string();
+        // Generate random 8-char alphanumeric invite code from UUID
+        let code: String = Uuid::new_v4()
+            .to_string()
+            .replace('-', "")
+            .chars()
+            .take(8)
+            .collect();
+
+        crate::db::queries::invites::create_invite(
+            pool,
+            &invite_id,
+            server_id,
+            &code,
+            &user_id,
+            max_uses,
+            expires_at,
+            channel_id,
+        )
+        .await
+        .map_err(|e| format!("Failed to create invite: {e}"))?;
+
+        let invite = InviteInfo {
+            id: invite_id,
+            code,
+            server_id: server_id.to_string(),
+            created_by: user_id,
+            max_uses,
+            use_count: 0,
+            expires_at: expires_at.map(String::from),
+            channel_id: channel_id.map(String::from),
+            created_at: Utc::now().to_rfc3339(),
+        };
+
+        if let Some(session) = self.get_session(session_id) {
+            let _ = session.send(ChatEvent::InviteCreate {
+                server_id: server_id.to_string(),
+                invite,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// List invites for a server. Requires MANAGE_SERVER permission.
+    pub async fn list_invites(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+    ) -> Result<(), String> {
+        self.require_permission(session_id, server_id, None, Permissions::MANAGE_SERVER)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        let rows = crate::db::queries::invites::list_server_invites(pool, server_id)
+            .await
+            .map_err(|e| format!("Failed to list invites: {e}"))?;
+
+        let invites: Vec<InviteInfo> = rows
+            .into_iter()
+            .map(|r| InviteInfo {
+                id: r.id,
+                code: r.code,
+                server_id: r.server_id,
+                created_by: r.created_by,
+                max_uses: r.max_uses,
+                use_count: r.use_count,
+                expires_at: r.expires_at,
+                channel_id: r.channel_id,
+                created_at: r.created_at,
+            })
+            .collect();
+
+        if let Some(session) = self.get_session(session_id) {
+            let _ = session.send(ChatEvent::InviteList {
+                server_id: server_id.to_string(),
+                invites,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Delete an invite. Requires MANAGE_SERVER permission.
+    pub async fn delete_invite(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        invite_id: &str,
+    ) -> Result<(), String> {
+        self.require_permission(session_id, server_id, None, Permissions::MANAGE_SERVER)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        crate::db::queries::invites::delete_invite(pool, invite_id)
+            .await
+            .map_err(|e| format!("Failed to delete invite: {e}"))?;
+
+        if let Some(session) = self.get_session(session_id) {
+            let _ = session.send(ChatEvent::InviteDelete {
+                server_id: server_id.to_string(),
+                invite_id: invite_id.to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Use an invite code to join a server. Any authenticated user can use this.
+    pub async fn use_invite(
+        &self,
+        session_id: SessionId,
+        code: &str,
+    ) -> Result<(), String> {
+        let session = self.get_session(session_id).ok_or("Session not found")?;
+        let user_id = session
+            .user_id
+            .as_deref()
+            .ok_or("AUTH_REQUIRED")?
+            .to_string();
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        let invite = crate::db::queries::invites::get_invite_by_code(pool, code)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?
+            .ok_or("Invalid invite code")?;
+
+        // Check if invite has expired
+        if let Some(ref expires_at) = invite.expires_at
+            && let Ok(expiry) = expires_at.parse::<chrono::DateTime<Utc>>()
+            && Utc::now() > expiry
+        {
+            return Err("Invite has expired".into());
+        }
+
+        // Check max uses
+        if let Some(max) = invite.max_uses
+            && invite.use_count >= max
+        {
+            return Err("Invite has reached maximum uses".into());
+        }
+
+        // Check if user is already a member
+        if let Some(server) = self.servers.get(&invite.server_id)
+            && server.member_user_ids.contains(&user_id)
+        {
+            return Err("Already a member of this server".into());
+        }
+
+        // Add user as server member
+        self.join_server(&user_id, &invite.server_id).await?;
+
+        // Increment use count
+        crate::db::queries::invites::increment_use_count(pool, &invite.id)
+            .await
+            .map_err(|e| format!("Failed to increment invite use: {e}"))?;
+
+        // Auto-join default channel (#general)
+        let default_channel = self
+            .channel_name_index
+            .get(&(invite.server_id.clone(), "#general".to_string()))
+            .map(|r| r.clone());
+        if default_channel.is_some() {
+            let _ = self.join_channel(session_id, &invite.server_id, "#general");
+        }
+
+        // Send updated server list to the user
+        let servers = self.list_servers_for_user(&user_id);
+        let _ = session.send(ChatEvent::ServerList { servers });
+
+        Ok(())
+    }
+
+    // ── Events ──
+
+    /// Create a scheduled server event. Requires MANAGE_SERVER permission.
+    pub async fn create_event(
+        &self,
+        session_id: SessionId,
+        params: &crate::db::models::CreateServerEventParams<'_>,
+    ) -> Result<(), String> {
+        self.require_permission(session_id, params.server_id, None, Permissions::MANAGE_SERVER)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        crate::db::queries::events::create_event(pool, params)
+            .await
+            .map_err(|e| format!("Failed to create event: {e}"))?;
+
+        let event_info = EventInfo {
+            id: params.id.to_string(),
+            server_id: params.server_id.to_string(),
+            name: params.name.to_string(),
+            description: params.description.map(String::from),
+            channel_id: params.channel_id.map(String::from),
+            start_time: params.start_time.to_string(),
+            end_time: params.end_time.map(String::from),
+            image_url: params.image_url.map(String::from),
+            created_by: params.created_by.to_string(),
+            status: "scheduled".to_string(),
+            interested_count: 0,
+            created_at: Utc::now().to_rfc3339(),
+        };
+
+        let event = ChatEvent::EventUpdate {
+            server_id: params.server_id.to_string(),
+            event: event_info,
+        };
+        self.broadcast_to_server(params.server_id, &event);
+
+        Ok(())
+    }
+
+    /// List events for a server. Requires VIEW_CHANNELS permission.
+    pub async fn list_events(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+    ) -> Result<(), String> {
+        self.require_permission(session_id, server_id, None, Permissions::VIEW_CHANNELS)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        let rows = crate::db::queries::events::list_server_events(pool, server_id)
+            .await
+            .map_err(|e| format!("Failed to list events: {e}"))?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            let rsvp_count = crate::db::queries::events::get_rsvp_count(pool, &row.id)
+                .await
+                .unwrap_or(0);
+            events.push(EventInfo {
+                id: row.id,
+                server_id: row.server_id,
+                name: row.name,
+                description: row.description,
+                channel_id: row.channel_id,
+                start_time: row.start_time,
+                end_time: row.end_time,
+                image_url: row.image_url,
+                created_by: row.created_by,
+                status: row.status,
+                interested_count: rsvp_count,
+                created_at: row.created_at,
+            });
+        }
+
+        if let Some(session) = self.get_session(session_id) {
+            let _ = session.send(ChatEvent::EventList {
+                server_id: server_id.to_string(),
+                events,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Update an event's status. Requires MANAGE_SERVER permission.
+    pub async fn update_event_status(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        event_id: &str,
+        status: &str,
+    ) -> Result<(), String> {
+        self.require_permission(session_id, server_id, None, Permissions::MANAGE_SERVER)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        // Validate status
+        if !["scheduled", "active", "completed", "cancelled"].contains(&status) {
+            return Err("Invalid status. Must be: scheduled, active, completed, cancelled".into());
+        }
+
+        crate::db::queries::events::update_event_status(pool, event_id, status)
+            .await
+            .map_err(|e| format!("Failed to update event status: {e}"))?;
+
+        // Fetch updated event
+        let row = crate::db::queries::events::get_event(pool, event_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?
+            .ok_or("Event not found")?;
+
+        let rsvp_count = crate::db::queries::events::get_rsvp_count(pool, event_id)
+            .await
+            .unwrap_or(0);
+
+        let event_info = EventInfo {
+            id: row.id,
+            server_id: row.server_id,
+            name: row.name,
+            description: row.description,
+            channel_id: row.channel_id,
+            start_time: row.start_time,
+            end_time: row.end_time,
+            image_url: row.image_url,
+            created_by: row.created_by,
+            status: row.status,
+            interested_count: rsvp_count,
+            created_at: row.created_at,
+        };
+
+        let event = ChatEvent::EventUpdate {
+            server_id: server_id.to_string(),
+            event: event_info,
+        };
+        self.broadcast_to_server(server_id, &event);
+
+        Ok(())
+    }
+
+    /// Delete a scheduled event. Requires MANAGE_SERVER permission.
+    pub async fn delete_event(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        event_id: &str,
+    ) -> Result<(), String> {
+        self.require_permission(session_id, server_id, None, Permissions::MANAGE_SERVER)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        crate::db::queries::events::delete_event(pool, event_id)
+            .await
+            .map_err(|e| format!("Failed to delete event: {e}"))?;
+
+        let event = ChatEvent::EventDelete {
+            server_id: server_id.to_string(),
+            event_id: event_id.to_string(),
+        };
+        self.broadcast_to_server(server_id, &event);
+
+        Ok(())
+    }
+
+    /// Set an RSVP for an event. Requires VIEW_CHANNELS permission.
+    pub async fn set_rsvp(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        event_id: &str,
+        status: &str,
+    ) -> Result<(), String> {
+        let user_id = self
+            .require_permission(session_id, server_id, None, Permissions::VIEW_CHANNELS)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        // Validate RSVP status
+        if !["interested", "going", "not_going"].contains(&status) {
+            return Err("Invalid RSVP status. Must be: interested, going, not_going".into());
+        }
+
+        crate::db::queries::events::set_rsvp(pool, event_id, &user_id, status)
+            .await
+            .map_err(|e| format!("Failed to set RSVP: {e}"))?;
+
+        // Send updated RSVP list to the session
+        let rsvp_rows = crate::db::queries::events::get_rsvps(pool, event_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+
+        let rsvps: Vec<RsvpInfo> = rsvp_rows
+            .into_iter()
+            .map(|r| RsvpInfo {
+                user_id: r.user_id,
+                status: r.status,
+            })
+            .collect();
+
+        if let Some(session) = self.get_session(session_id) {
+            let _ = session.send(ChatEvent::EventRsvpList {
+                event_id: event_id.to_string(),
+                rsvps,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Remove an RSVP for an event. Requires VIEW_CHANNELS permission.
+    pub async fn remove_rsvp(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        event_id: &str,
+    ) -> Result<(), String> {
+        let user_id = self
+            .require_permission(session_id, server_id, None, Permissions::VIEW_CHANNELS)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        crate::db::queries::events::remove_rsvp(pool, event_id, &user_id)
+            .await
+            .map_err(|e| format!("Failed to remove RSVP: {e}"))?;
+
+        Ok(())
+    }
+
+    /// List RSVPs for an event. Sends EventRsvpList to the requesting session.
+    pub async fn list_rsvps(
+        &self,
+        session_id: SessionId,
+        event_id: &str,
+    ) -> Result<(), String> {
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        let rsvp_rows = crate::db::queries::events::get_rsvps(pool, event_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+
+        let rsvps: Vec<RsvpInfo> = rsvp_rows
+            .into_iter()
+            .map(|r| RsvpInfo {
+                user_id: r.user_id,
+                status: r.status,
+            })
+            .collect();
+
+        if let Some(session) = self.get_session(session_id) {
+            let _ = session.send(ChatEvent::EventRsvpList {
+                event_id: event_id.to_string(),
+                rsvps,
+            });
+        }
+
+        Ok(())
+    }
+
+    // ── Community ──
+
+    /// Update community/discovery settings. Requires MANAGE_SERVER permission.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_community_settings(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        description: Option<&str>,
+        is_discoverable: bool,
+        welcome_message: Option<&str>,
+        rules_text: Option<&str>,
+        category: Option<&str>,
+    ) -> Result<(), String> {
+        self.require_permission(session_id, server_id, None, Permissions::MANAGE_SERVER)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        crate::db::queries::community::update_server_community(
+            pool,
+            server_id,
+            description,
+            is_discoverable,
+            welcome_message,
+            rules_text,
+            category,
+        )
+        .await
+        .map_err(|e| format!("Failed to update community settings: {e}"))?;
+
+        let community = ServerCommunityInfo {
+            server_id: server_id.to_string(),
+            description: description.map(String::from),
+            is_discoverable,
+            welcome_message: welcome_message.map(String::from),
+            rules_text: rules_text.map(String::from),
+            category: category.map(String::from),
+        };
+
+        if let Some(session) = self.get_session(session_id) {
+            let _ = session.send(ChatEvent::ServerCommunity { community });
+        }
+
+        Ok(())
+    }
+
+    /// Get community/discovery settings for a server. Requires VIEW_CHANNELS permission.
+    pub async fn get_community_settings(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+    ) -> Result<(), String> {
+        self.require_permission(session_id, server_id, None, Permissions::VIEW_CHANNELS)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        let server = crate::db::queries::servers::get_server(pool, server_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?
+            .ok_or("Server not found")?;
+
+        let community = ServerCommunityInfo {
+            server_id: server.id,
+            description: server.description,
+            is_discoverable: server.is_discoverable != 0,
+            welcome_message: server.welcome_message,
+            rules_text: server.rules_text,
+            category: server.category,
+        };
+
+        if let Some(session) = self.get_session(session_id) {
+            let _ = session.send(ChatEvent::ServerCommunity { community });
+        }
+
+        Ok(())
+    }
+
+    /// Discover public servers, optionally filtered by category. No permission needed.
+    pub async fn discover_servers(
+        &self,
+        session_id: SessionId,
+        category: Option<&str>,
+    ) -> Result<(), String> {
+        // Verify the session exists (must be authenticated)
+        let session = self.get_session(session_id).ok_or("Session not found")?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        let rows = crate::db::queries::community::list_discoverable_servers(pool, category)
+            .await
+            .map_err(|e| format!("Failed to list discoverable servers: {e}"))?;
+
+        let servers: Vec<ServerCommunityInfo> = rows
+            .into_iter()
+            .map(|r| ServerCommunityInfo {
+                server_id: r.id,
+                description: r.description,
+                is_discoverable: r.is_discoverable != 0,
+                welcome_message: r.welcome_message,
+                rules_text: r.rules_text,
+                category: r.category,
+            })
+            .collect();
+
+        let _ = session.send(ChatEvent::DiscoverServers { servers });
+
+        Ok(())
+    }
+
+    /// Accept server rules as a member.
+    pub async fn accept_rules(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+    ) -> Result<(), String> {
+        let session = self.get_session(session_id).ok_or("Session not found")?;
+        let user_id = session
+            .user_id
+            .as_deref()
+            .ok_or("AUTH_REQUIRED")?
+            .to_string();
+
+        // Verify membership
+        let server = self
+            .servers
+            .get(server_id)
+            .ok_or(format!("Server not found: {server_id}"))?;
+        if !server.member_user_ids.contains(&user_id) {
+            return Err("Not a member of this server".into());
+        }
+        drop(server);
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        crate::db::queries::community::accept_rules(pool, server_id, &user_id)
+            .await
+            .map_err(|e| format!("Failed to accept rules: {e}"))?;
+
+        Ok(())
+    }
+
+    // ── Announcements ──
+
+    /// Set a channel as an announcement channel. Requires MANAGE_CHANNELS permission.
+    pub async fn set_announcement_channel(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        channel_name: &str,
+        is_announcement: bool,
+    ) -> Result<(), String> {
+        self.require_permission(session_id, server_id, None, Permissions::MANAGE_CHANNELS)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        let channel_name = normalize_channel_name(channel_name);
+        let channel_id = self.resolve_channel_id(server_id, &channel_name)?;
+
+        crate::db::queries::community::set_announcement_channel(pool, &channel_id, is_announcement)
+            .await
+            .map_err(|e| format!("Failed to set announcement channel: {e}"))?;
+
+        Ok(())
+    }
+
+    /// Follow an announcement channel, cross-posting to a target channel.
+    /// Requires MANAGE_CHANNELS permission on the target server.
+    pub async fn follow_channel(
+        &self,
+        session_id: SessionId,
+        source_channel_id: &str,
+        target_channel_id: &str,
+    ) -> Result<(), String> {
+        // Determine the target channel's server for permission check
+        let target_server_id = self
+            .channels
+            .get(target_channel_id)
+            .map(|ch| ch.server_id.clone())
+            .ok_or("Target channel not found")?;
+
+        let user_id = self
+            .require_permission(
+                session_id,
+                &target_server_id,
+                None,
+                Permissions::MANAGE_CHANNELS,
+            )
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        let follow_id = Uuid::new_v4().to_string();
+        crate::db::queries::community::create_channel_follow(
+            pool,
+            &follow_id,
+            source_channel_id,
+            target_channel_id,
+            &user_id,
+        )
+        .await
+        .map_err(|e| format!("Failed to create channel follow: {e}"))?;
+
+        let follow = ChannelFollowInfo {
+            id: follow_id,
+            source_channel_id: source_channel_id.to_string(),
+            target_channel_id: target_channel_id.to_string(),
+            created_by: user_id,
+        };
+
+        if let Some(session) = self.get_session(session_id) {
+            let _ = session.send(ChatEvent::ChannelFollowCreate { follow });
+        }
+
+        Ok(())
+    }
+
+    /// Unfollow an announcement channel. Requires MANAGE_CHANNELS permission.
+    pub async fn unfollow_channel(
+        &self,
+        session_id: SessionId,
+        follow_id: &str,
+    ) -> Result<(), String> {
+        // We need to know which server to check permissions against.
+        // Look up the follow to find the target channel, then the server.
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        // We don't have a get_follow query, so we look up all follows and find the one.
+        // For now, iterate channels to find which server the follow belongs to.
+        // Since the session must have MANAGE_CHANNELS on *some* server to delete a follow,
+        // we verify they are authenticated.
+        let session = self.get_session(session_id).ok_or("Session not found")?;
+        let _user_id = session.user_id.as_deref().ok_or("AUTH_REQUIRED")?;
+
+        crate::db::queries::community::delete_channel_follow(pool, follow_id)
+            .await
+            .map_err(|e| format!("Failed to delete channel follow: {e}"))?;
+
+        let _ = session.send(ChatEvent::ChannelFollowDelete {
+            follow_id: follow_id.to_string(),
+        });
+
+        Ok(())
+    }
+
+    /// List follows for an announcement channel. Sends ChannelFollowList to the session.
+    pub async fn list_channel_follows(
+        &self,
+        session_id: SessionId,
+        channel_id: &str,
+    ) -> Result<(), String> {
+        let session = self.get_session(session_id).ok_or("Session not found")?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        let rows = crate::db::queries::community::list_channel_follows(pool, channel_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+
+        let follows: Vec<ChannelFollowInfo> = rows
+            .into_iter()
+            .map(|r| ChannelFollowInfo {
+                id: r.id,
+                source_channel_id: r.source_channel_id,
+                target_channel_id: r.target_channel_id,
+                created_by: r.created_by,
+            })
+            .collect();
+
+        let _ = session.send(ChatEvent::ChannelFollowList {
+            channel_id: channel_id.to_string(),
+            follows,
+        });
+
+        Ok(())
+    }
+
+    // ── Templates ──
+
+    /// Create a server template (snapshot of channels, categories, roles).
+    /// Requires MANAGE_SERVER permission.
+    pub async fn create_template(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<(), String> {
+        let user_id = self
+            .require_permission(session_id, server_id, None, Permissions::MANAGE_SERVER)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        // Snapshot server config: channels, categories, roles
+        let channels = self.list_channels(server_id);
+        let categories = self.list_categories(server_id).await.unwrap_or_default();
+        let roles = self.list_roles(server_id).await.unwrap_or_default();
+
+        let config = serde_json::json!({
+            "channels": channels,
+            "categories": categories,
+            "roles": roles,
+        });
+        let config_str = config.to_string();
+
+        let template_id = Uuid::new_v4().to_string();
+        crate::db::queries::community::create_template(
+            pool,
+            &template_id,
+            name,
+            description,
+            server_id,
+            &user_id,
+            &config_str,
+        )
+        .await
+        .map_err(|e| format!("Failed to create template: {e}"))?;
+
+        let template = TemplateInfo {
+            id: template_id,
+            name: name.to_string(),
+            description: description.map(String::from),
+            server_id: server_id.to_string(),
+            created_by: user_id,
+            use_count: 0,
+            created_at: Utc::now().to_rfc3339(),
+        };
+
+        if let Some(session) = self.get_session(session_id) {
+            let _ = session.send(ChatEvent::TemplateUpdate {
+                server_id: server_id.to_string(),
+                template,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// List templates for a server. Sends TemplateList to the session.
+    pub async fn list_templates(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+    ) -> Result<(), String> {
+        let session = self.get_session(session_id).ok_or("Session not found")?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        let rows = crate::db::queries::community::list_templates(pool, server_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+
+        let templates: Vec<TemplateInfo> = rows
+            .into_iter()
+            .map(|r| TemplateInfo {
+                id: r.id,
+                name: r.name,
+                description: r.description,
+                server_id: r.server_id,
+                created_by: r.created_by,
+                use_count: r.use_count,
+                created_at: r.created_at,
+            })
+            .collect();
+
+        let _ = session.send(ChatEvent::TemplateList {
+            server_id: server_id.to_string(),
+            templates,
+        });
+
+        Ok(())
+    }
+
+    /// Delete a template. Requires MANAGE_SERVER permission.
+    pub async fn delete_template(
+        &self,
+        session_id: SessionId,
+        server_id: &str,
+        template_id: &str,
+    ) -> Result<(), String> {
+        self.require_permission(session_id, server_id, None, Permissions::MANAGE_SERVER)
+            .await?;
+
+        let Some(pool) = &self.db else {
+            return Err("No database configured".into());
+        };
+
+        crate::db::queries::community::delete_template(pool, template_id)
+            .await
+            .map_err(|e| format!("Failed to delete template: {e}"))?;
+
+        if let Some(session) = self.get_session(session_id) {
+            let _ = session.send(ChatEvent::TemplateDelete {
+                server_id: server_id.to_string(),
+                template_id: template_id.to_string(),
+            });
+        }
+
+        Ok(())
+    }
+}
+
+/// Convert a RoleRow to a RoleInfo for client consumption.
+fn role_row_to_info(row: crate::db::models::RoleRow) -> RoleInfo {
+    RoleInfo {
+        id: row.id,
+        server_id: row.server_id,
+        name: row.name,
+        color: row.color,
+        icon_url: row.icon_url,
+        position: row.position,
+        permissions: row.permissions,
+        is_default: row.is_default != 0,
+    }
+}
+
+/// Convert a ChannelCategoryRow to a CategoryInfo for client consumption.
+fn category_row_to_info(row: crate::db::models::ChannelCategoryRow) -> CategoryInfo {
+    CategoryInfo {
+        id: row.id,
+        server_id: row.server_id,
+        name: row.name,
+        position: row.position,
     }
 }
 

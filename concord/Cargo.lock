@@ -476,6 +476,7 @@ dependencies = [
  "atproto-oauth",
  "axum",
  "axum-extra",
+ "bitflags 2.10.0",
  "chrono",
  "clap",
  "dashmap",

@@ -194,3 +194,35 @@ pub async fn set_system_admin(
         .await?;
     Ok(())
 }
+
+/// Get a member's server-specific nickname.
+pub async fn get_server_nickname(
+    pool: &SqlitePool,
+    server_id: &str,
+    user_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT nickname FROM server_members WHERE server_id = ? AND user_id = ?",
+    )
+    .bind(server_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|r| r.0))
+}
+
+/// Set a member's server-specific nickname.
+pub async fn set_server_nickname(
+    pool: &SqlitePool,
+    server_id: &str,
+    user_id: &str,
+    nickname: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE server_members SET nickname = ? WHERE server_id = ? AND user_id = ?")
+        .bind(nickname)
+        .bind(server_id)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}

@@ -1,17 +1,21 @@
-import { useEffect } from 'react';
+import { useEffect, useMemo } from 'react';
 import { useChatStore } from '../../stores/chatStore';
 import { useUiStore } from '../../stores/uiStore';
 import { channelKey } from '../../api/types';
-import type { ChannelInfo } from '../../api/types';
+import type { CategoryInfo, ChannelInfo } from '../../api/types';
 
 const EMPTY_CHANNELS: ChannelInfo[] = [];
 const EMPTY_UNREAD: Record<string, number> = {};
+const EMPTY_CATEGORIES: CategoryInfo[] = [];
 
 export function ChannelList() {
   const activeServer = useUiStore((s) => s.activeServer);
   const channels = useChatStore((s) => (activeServer ? s.channels[activeServer] ?? EMPTY_CHANNELS : EMPTY_CHANNELS));
+  const categories = useChatStore((s) => (activeServer ? s.categories[activeServer] ?? EMPTY_CATEGORIES : EMPTY_CATEGORIES));
   const activeChannel = useUiStore((s) => s.activeChannel);
   const setActiveChannel = useUiStore((s) => s.setActiveChannel);
+  const collapsedCategories = useUiStore((s) => s.collapsedCategories);
+  const toggleCategory = useUiStore((s) => s.toggleCategory);
   const joinChannel = useChatStore((s) => s.joinChannel);
   const getMembers = useChatStore((s) => s.getMembers);
   const fetchHistory = useChatStore((s) => s.fetchHistory);
@@ -41,6 +45,28 @@ export function ChannelList() {
     }
   }, [activeServer, activeChannel, messages, markRead]);
 
+  // Group channels by category, sorted by position
+  const grouped = useMemo(() => {
+    const sortedCategories = [...categories].sort((a, b) => a.position - b.position);
+    const sortedChannels = [...channels].sort((a, b) => a.position - b.position);
+
+    const uncategorized = sortedChannels.filter((ch) => !ch.category_id);
+    const groups: { category: CategoryInfo | null; channels: ChannelInfo[] }[] = [];
+
+    // Uncategorized channels go first
+    if (uncategorized.length > 0) {
+      groups.push({ category: null, channels: uncategorized });
+    }
+
+    // Then each category with its channels
+    for (const cat of sortedCategories) {
+      const catChannels = sortedChannels.filter((ch) => ch.category_id === cat.id);
+      groups.push({ category: cat, channels: catChannels });
+    }
+
+    return groups;
+  }, [channels, categories]);
+
   const handleSelect = (name: string) => {
     if (!activeServer) return;
     setActiveChannel(name);
@@ -51,42 +77,91 @@ export function ChannelList() {
 
   return (
     <div className="flex h-full flex-col bg-bg-secondary">
-      <div className="flex h-12 items-center border-b border-border-primary px-4">
+      <div className="flex h-12 items-center justify-between border-b border-border-primary px-4">
         <h2 className="font-semibold text-text-primary truncate">{serverName}</h2>
+        {activeServer && (
+          <button
+            onClick={() => useUiStore.getState().setShowServerSettings(true)}
+            className="rounded p-1 text-text-muted transition-colors hover:text-text-primary"
+            title="Server Settings"
+          >
+            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+            </svg>
+          </button>
+        )}
       </div>
 
       <div className="flex-1 overflow-y-auto px-2 pt-4">
-        <div className="mb-2 flex items-center justify-between px-2">
-          <span className="text-xs font-semibold uppercase tracking-wide text-text-muted">
-            Channels
-          </span>
-        </div>
-
-        {channels.map((ch) => {
-          const key = channelKey(activeServer!, ch.name);
-          const unread = unreadCounts[key] || 0;
-          const isActive = activeChannel === ch.name;
+        {grouped.map((group, gi) => {
+          const isCollapsed = group.category ? collapsedCategories[group.category.id] : false;
 
           return (
-            <button
-              key={ch.name}
-              onClick={() => handleSelect(ch.name)}
-              className={`mb-0.5 flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm transition-colors ${
-                isActive
-                  ? 'bg-bg-active text-text-primary'
-                  : unread > 0
-                    ? 'text-text-primary font-semibold hover:bg-bg-hover'
-                    : 'text-text-muted hover:bg-bg-hover hover:text-text-secondary'
-              }`}
-            >
-              <span className="text-lg leading-none text-text-muted">#</span>
-              <span className="min-w-0 flex-1 truncate">{ch.name.replace(/^#/, '')}</span>
-              {unread > 0 && !isActive && (
-                <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-red-500 px-1.5 text-xs font-bold text-white">
-                  {unread > 99 ? '99+' : unread}
-                </span>
+            <div key={group.category?.id ?? `uncategorized-${gi}`} className="mb-1">
+              {/* Category header */}
+              {group.category ? (
+                <button
+                  onClick={() => toggleCategory(group.category!.id)}
+                  className="mb-0.5 flex w-full items-center gap-1 px-1 py-1 text-xs font-semibold uppercase tracking-wide text-text-muted hover:text-text-secondary"
+                >
+                  <svg
+                    className={`h-3 w-3 transition-transform ${isCollapsed ? '-rotate-90' : ''}`}
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    strokeWidth={2}
+                  >
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                  </svg>
+                  <span className="truncate">{group.category.name}</span>
+                </button>
+              ) : (
+                <div className="mb-0.5 flex items-center px-2 py-1">
+                  <span className="text-xs font-semibold uppercase tracking-wide text-text-muted">
+                    Channels
+                  </span>
+                </div>
               )}
-            </button>
+
+              {/* Channel list (hidden when collapsed, unless channel has unread or is active) */}
+              {group.channels.map((ch) => {
+                const key = channelKey(activeServer!, ch.name);
+                const unread = unreadCounts[key] || 0;
+                const isActive = activeChannel === ch.name;
+                const shouldShow = !isCollapsed || isActive || unread > 0;
+
+                if (!shouldShow) return null;
+
+                return (
+                  <button
+                    key={ch.name}
+                    onClick={() => handleSelect(ch.name)}
+                    className={`mb-0.5 flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm transition-colors ${
+                      isActive
+                        ? 'bg-bg-active text-text-primary'
+                        : unread > 0
+                          ? 'text-text-primary font-semibold hover:bg-bg-hover'
+                          : 'text-text-muted hover:bg-bg-hover hover:text-text-secondary'
+                    }`}
+                  >
+                    {ch.is_private ? (
+                      <svg className="h-4 w-4 shrink-0 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                      </svg>
+                    ) : (
+                      <span className="text-lg leading-none text-text-muted">#</span>
+                    )}
+                    <span className="min-w-0 flex-1 truncate">{ch.name.replace(/^#/, '')}</span>
+                    {unread > 0 && !isActive && (
+                      <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-red-500 px-1.5 text-xs font-bold text-white">
+                        {unread > 99 ? '99+' : unread}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
           );
         })}
       </div>

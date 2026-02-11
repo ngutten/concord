@@ -12,7 +12,8 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::auth::token::{generate_irc_token, hash_irc_token};
-use crate::db::queries::{attachments, emoji, servers, users};
+use crate::db::queries::{attachments, community, emoji, invites, servers, users};
+use sqlx;
 use crate::engine::events::HistoryMessage;
 
 use super::app_state::AppState;
@@ -556,6 +557,7 @@ pub async fn upload_file(
             info!(
                 user_id = %auth.user_id,
                 cid = %blob_ref.cid,
+                blob_url = %blob_ref.url,
                 "Uploaded blob to PDS"
             );
             if let Err(e) = attachments::insert_attachment_with_blob(
@@ -652,6 +654,7 @@ pub async fn get_upload(
 
     // If the attachment has a PDS blob URL, redirect to it
     if let Some(blob_url) = &attachment.blob_url {
+        info!(attachment_id = %attachment_id, blob_url = %blob_url, "Redirecting to PDS blob");
         return axum::response::Redirect::temporary(blob_url).into_response();
     }
 
@@ -773,6 +776,213 @@ pub async fn delete_server_emoji(
         Err(e) => {
             error!(error = %e, "Failed to delete emoji");
             (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
+        }
+    }
+}
+
+// ── Profile endpoints ──
+
+#[derive(Deserialize)]
+pub struct UpdateProfileRequest {
+    pub bio: Option<String>,
+    pub pronouns: Option<String>,
+    pub banner_url: Option<String>,
+}
+
+/// GET /api/users/:id/profile — get a user's full profile
+pub async fn get_user_full_profile(
+    State(state): State<Arc<AppState>>,
+    Path(user_id): Path<String>,
+) -> impl IntoResponse {
+    let user = match users::get_user(&state.db, &user_id).await {
+        Ok(Some((id, username, _email, avatar_url))) => (id, username, avatar_url),
+        Ok(None) => return (StatusCode::NOT_FOUND, "User not found").into_response(),
+        Err(e) => {
+            error!(error = %e, "Failed to get user");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
+        }
+    };
+
+    let profile = crate::db::queries::profiles::get_profile(&state.db, &user.0)
+        .await
+        .unwrap_or(None);
+
+    let created_at = sqlx::query_scalar::<_, String>("SELECT created_at FROM users WHERE id = ?")
+        .bind(&user.0)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or_else(|_| "unknown".into());
+
+    Json(serde_json::json!({
+        "user_id": user.0,
+        "username": user.1,
+        "avatar_url": user.2,
+        "bio": profile.as_ref().and_then(|p| p.bio.as_ref()),
+        "pronouns": profile.as_ref().and_then(|p| p.pronouns.as_ref()),
+        "banner_url": profile.as_ref().and_then(|p| p.banner_url.as_ref()),
+        "created_at": created_at,
+    }))
+    .into_response()
+}
+
+/// PATCH /api/profile — update own profile
+pub async fn update_profile(
+    State(state): State<Arc<AppState>>,
+    auth: AuthUser,
+    Json(body): Json<UpdateProfileRequest>,
+) -> impl IntoResponse {
+    match crate::db::queries::profiles::upsert_profile(
+        &state.db,
+        &auth.user_id,
+        body.bio.as_deref(),
+        body.pronouns.as_deref(),
+        body.banner_url.as_deref(),
+    )
+    .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            error!(error = %e, "Failed to update profile");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
+        }
+    }
+}
+
+// ── Search endpoint ──
+
+#[derive(Deserialize)]
+pub struct SearchParams {
+    pub server_id: String,
+    pub q: String,
+    pub channel: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// GET /api/search — search messages
+pub async fn search_messages(
+    State(state): State<Arc<AppState>>,
+    _auth: AuthUser,
+    Query(params): Query<SearchParams>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(25).min(50);
+    let offset = params.offset.unwrap_or(0);
+
+    // Resolve channel name to ID if needed
+    let channel_id = if let Some(ref ch_name) = params.channel {
+        match crate::db::queries::channels::get_channel_by_name(&state.db, &params.server_id, ch_name).await {
+            Ok(Some(row)) => Some(row.id),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    match crate::db::queries::search::search_messages(
+        &state.db,
+        &params.server_id,
+        &params.q,
+        channel_id.as_deref(),
+        limit,
+        offset,
+    )
+    .await
+    {
+        Ok((rows, total)) => {
+            let results: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.id,
+                        "from": r.sender_nick,
+                        "content": r.content,
+                        "timestamp": r.created_at,
+                        "channel_id": r.channel_id,
+                        "edited_at": r.edited_at,
+                    })
+                })
+                .collect();
+
+            Json(serde_json::json!({
+                "query": params.q,
+                "results": results,
+                "total_count": total,
+                "offset": offset,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            error!(error = %e, "Search failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Search error").into_response()
+        }
+    }
+}
+
+// ── Phase 7: Community & Discovery (public endpoints) ──
+
+/// GET /api/invite/{code} — public invite preview
+pub async fn get_invite_preview(
+    State(state): State<Arc<AppState>>,
+    Path(code): Path<String>,
+) -> impl IntoResponse {
+    let pool = &state.db;
+    match invites::get_invite_by_code(pool, &code).await {
+        Ok(Some(invite)) => {
+            // Check not expired
+            if let Some(ref exp) = invite.expires_at
+                && exp < &chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
+            {
+                return (StatusCode::GONE, Json(serde_json::json!({"error": "Invite expired"}))).into_response();
+            }
+            // Check max uses
+            if let Some(max) = invite.max_uses
+                && invite.use_count >= max
+            {
+                return (StatusCode::GONE, Json(serde_json::json!({"error": "Invite has reached max uses"}))).into_response();
+            }
+            // Get server info
+            match servers::get_server(pool, &invite.server_id).await {
+                Ok(Some(server)) => {
+                    Json(serde_json::json!({
+                        "code": invite.code,
+                        "server_id": server.id,
+                        "server_name": server.name,
+                        "server_icon_url": server.icon_url,
+                    })).into_response()
+                }
+                _ => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct DiscoverParams {
+    pub category: Option<String>,
+}
+
+/// GET /api/discover — public server discovery
+pub async fn discover_servers(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<DiscoverParams>,
+) -> impl IntoResponse {
+    let pool = &state.db;
+    match community::list_discoverable_servers(pool, params.category.as_deref()).await {
+        Ok(servers) => {
+            let results: Vec<serde_json::Value> = servers.iter().map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "name": s.name,
+                    "icon_url": s.icon_url,
+                    "description": s.description,
+                    "category": s.category,
+                })
+            }).collect();
+            Json(serde_json::json!({ "servers": results })).into_response()
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()
         }
     }
 }

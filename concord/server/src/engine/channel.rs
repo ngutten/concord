@@ -16,6 +16,20 @@ pub struct ChannelState {
     /// Session IDs of currently connected members.
     pub members: HashSet<SessionId>,
     pub created_at: DateTime<Utc>,
+    /// Category this channel belongs to (None = uncategorized).
+    pub category_id: Option<String>,
+    /// Sort position within its category.
+    pub position: i32,
+    /// Whether this channel is private (members-only).
+    pub is_private: bool,
+    /// Channel type: "text", "public_thread", "private_thread", "forum".
+    pub channel_type: String,
+    /// For threads: the message ID this thread was created from.
+    pub thread_parent_message_id: Option<String>,
+    /// Auto-archive duration in minutes (default 1440 = 24h).
+    pub auto_archive_minutes: i32,
+    /// Whether this channel/thread is archived.
+    pub archived: bool,
 }
 
 impl ChannelState {
@@ -29,6 +43,13 @@ impl ChannelState {
             topic_set_at: None,
             members: HashSet::new(),
             created_at: Utc::now(),
+            category_id: None,
+            position: 0,
+            is_private: false,
+            channel_type: "text".to_string(),
+            thread_parent_message_id: None,
+            auto_archive_minutes: 1440,
+            archived: false,
         }
     }
 

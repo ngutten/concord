@@ -3,7 +3,7 @@ use atproto_identity::key::KeyData;
 use atproto_oauth::dpop::request_dpop;
 use atproto_oauth::jwk;
 use atproto_oauth::jwt::{self, Claims, JoseClaims, Header};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tracing::{info, warn};
 
@@ -67,21 +67,33 @@ pub async fn upload_blob_to_pds(
     let upload_url = format!("{}/xrpc/com.atproto.repo.uploadBlob", pds_url);
 
     // Try upload, refreshing token once if expired
-    match do_upload(&dpop_key, &creds.access_token, &upload_url, &file_bytes, content_type).await {
-        Ok(blob_resp) => Ok(finalize_blob_ref(blob_resp, pds_url, &creds.did)),
+    let (blob_resp, token_used) = match do_upload(&dpop_key, &creds.access_token, &upload_url, &file_bytes, content_type).await {
+        Ok(resp) => (resp, creds.access_token.clone()),
         Err(e) => {
             warn!(error = %e, "PDS upload failed, attempting token refresh");
             let new_token = refresh_access_token(
                 pool, user_id, &creds, &dpop_key, signing_key, client_id, redirect_uri,
             )
             .await?;
-            let blob_resp =
-                do_upload(&dpop_key, &new_token, &upload_url, &file_bytes, content_type)
-                    .await
-                    .context("PDS upload failed after token refresh")?;
-            Ok(finalize_blob_ref(blob_resp, pds_url, &creds.did))
+            let resp = do_upload(&dpop_key, &new_token, &upload_url, &file_bytes, content_type)
+                .await
+                .context("PDS upload failed after token refresh")?;
+            (resp, new_token)
         }
+    };
+
+    let blob_ref = finalize_blob_ref(&blob_resp, pds_url, &creds.did);
+
+    // Pin the blob by creating a record that references it in the user's repo.
+    // Without this, the PDS will not serve the blob via com.atproto.sync.getBlob.
+    let file_size = file_bytes.len();
+    if let Err(e) = pin_blob_with_record(
+        &dpop_key, &token_used, pds_url, &creds.did, &blob_ref.cid, content_type, file_size,
+    ).await {
+        warn!(error = %e, "Failed to pin blob with createRecord (blob may not be servable)");
     }
+
+    Ok(blob_ref)
 }
 
 /// Perform the actual blob upload with DPoP auth (plain reqwest, no middleware).
@@ -171,12 +183,13 @@ async fn do_upload_with_nonce(
         .context("Failed to parse PDS upload response")
 }
 
-fn finalize_blob_ref(resp: UploadBlobResponse, pds_url: &str, did: &str) -> BlobRef {
+fn finalize_blob_ref(resp: &UploadBlobResponse, pds_url: &str, did: &str) -> BlobRef {
     let cid = resp
         .blob
         .ref_link
-        .map(|r| r.link)
-        .or(resp.blob.cid_str)
+        .as_ref()
+        .map(|r| r.link.clone())
+        .or_else(|| resp.blob.cid_str.clone())
         .unwrap_or_default();
 
     // Construct a download URL via the PDS sync endpoint (requires both did and cid)
@@ -188,6 +201,131 @@ fn finalize_blob_ref(resp: UploadBlobResponse, pds_url: &str, did: &str) -> Blob
     );
 
     BlobRef { cid, url }
+}
+
+/// JSON body for com.atproto.repo.createRecord
+#[derive(Serialize)]
+struct CreateRecordRequest {
+    repo: String,
+    collection: String,
+    record: AttachmentRecord,
+}
+
+/// A minimal record that references a blob, pinning it in the user's PDS repo.
+#[derive(Serialize)]
+struct AttachmentRecord {
+    #[serde(rename = "$type")]
+    record_type: String,
+    blob: BlobObject,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+}
+
+/// AT Protocol blob reference object for embedding in records.
+#[derive(Serialize)]
+struct BlobObject {
+    #[serde(rename = "$type")]
+    blob_type: String,
+    #[serde(rename = "ref")]
+    ref_link: BlobLink,
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    size: usize,
+}
+
+#[derive(Serialize)]
+struct BlobLink {
+    #[serde(rename = "$link")]
+    link: String,
+}
+
+/// Create a record in the user's PDS repo that references the uploaded blob.
+/// This pins the blob so it can be served via com.atproto.sync.getBlob.
+async fn pin_blob_with_record(
+    dpop_key: &KeyData,
+    access_token: &str,
+    pds_url: &str,
+    did: &str,
+    cid: &str,
+    content_type: &str,
+    file_size: usize,
+) -> Result<()> {
+    let create_url = format!("{}/xrpc/com.atproto.repo.createRecord", pds_url);
+
+    let body = CreateRecordRequest {
+        repo: did.to_string(),
+        collection: "chat.concord.attachment".to_string(),
+        record: AttachmentRecord {
+            record_type: "chat.concord.attachment".to_string(),
+            blob: BlobObject {
+                blob_type: "blob".to_string(),
+                ref_link: BlobLink {
+                    link: cid.to_string(),
+                },
+                mime_type: content_type.to_string(),
+                size: file_size,
+            },
+            created_at: chrono::Utc::now().to_rfc3339(),
+        },
+    };
+
+    let body_json = serde_json::to_string(&body)
+        .context("Failed to serialize createRecord body")?;
+
+    let (dpop_token, _header, _claims) =
+        request_dpop(dpop_key, "POST", &create_url, access_token)
+            .context("Failed to create DPoP proof for createRecord")?;
+
+    let http_client = reqwest::Client::new();
+
+    let resp = http_client
+        .post(&create_url)
+        .header("Authorization", format!("DPoP {}", access_token))
+        .header("DPoP", &dpop_token)
+        .header("Content-Type", "application/json")
+        .body(body_json.clone())
+        .send()
+        .await
+        .context("createRecord HTTP request failed")?;
+
+    // Handle DPoP nonce challenge
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+        && let Some(nonce) = resp.headers().get("DPoP-Nonce").and_then(|v| v.to_str().ok())
+    {
+        let (_dpop_token2, header2, mut claims2) =
+            request_dpop(dpop_key, "POST", &create_url, access_token)
+                .context("Failed to create DPoP proof for createRecord nonce retry")?;
+        claims2
+            .private
+            .insert("nonce".to_string(), nonce.to_string().into());
+        let dpop_with_nonce = jwt::mint(dpop_key, &header2, &claims2)
+            .map_err(|e| anyhow!("Failed to mint DPoP with nonce: {e}"))?;
+
+        let resp2 = http_client
+            .post(&create_url)
+            .header("Authorization", format!("DPoP {}", access_token))
+            .header("DPoP", &dpop_with_nonce)
+            .header("Content-Type", "application/json")
+            .body(body_json)
+            .send()
+            .await
+            .context("createRecord HTTP request failed (nonce retry)")?;
+
+        if !resp2.status().is_success() {
+            let status = resp2.status();
+            let body = resp2.text().await.unwrap_or_default();
+            return Err(anyhow!("createRecord returned {} (nonce retry): {}", status, body));
+        }
+        return Ok(());
+    }
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("createRecord returned {}: {}", status, body));
+    }
+
+    Ok(())
 }
 
 /// Build a private_key_jwt client assertion for the given token endpoint.
