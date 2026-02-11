@@ -1,19 +1,24 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useChatStore } from '../../stores/chatStore';
 import { useUiStore } from '../../stores/uiStore';
-import type { RoleInfo, CategoryInfo } from '../../api/types';
+import type { RoleInfo, CategoryInfo, ChannelInfo } from '../../api/types';
 import { hasPermission, Permissions } from '../../api/types';
+import { uploadFile } from '../../api/client';
 
 const EMPTY_ROLES: RoleInfo[] = [];
 const EMPTY_CATEGORIES: CategoryInfo[] = [];
+const EMPTY_CHANNELS: ChannelInfo[] = [];
+const EMPTY_EMOJI: Record<string, string> = {};
 
-type Tab = 'roles' | 'categories';
+type Tab = 'overview' | 'channels' | 'roles' | 'categories' | 'emoji';
 
 export function ServerSettings() {
   const activeServer = useUiStore((s) => s.activeServer);
   const setShowServerSettings = useUiStore((s) => s.setShowServerSettings);
   const roles = useChatStore((s) => (activeServer ? s.roles[activeServer] ?? EMPTY_ROLES : EMPTY_ROLES));
   const categories = useChatStore((s) => (activeServer ? s.categories[activeServer] ?? EMPTY_CATEGORIES : EMPTY_CATEGORIES));
+  const channels = useChatStore((s) => (activeServer ? s.channels[activeServer] ?? EMPTY_CHANNELS : EMPTY_CHANNELS));
+  const customEmoji = useChatStore((s) => (activeServer ? s.customEmoji[activeServer] ?? EMPTY_EMOJI : EMPTY_EMOJI));
   const servers = useChatStore((s) => s.servers);
   const createRole = useChatStore((s) => s.createRole);
   const updateRole = useChatStore((s) => s.updateRole);
@@ -21,12 +26,34 @@ export function ServerSettings() {
   const createCategory = useChatStore((s) => s.createCategory);
   const updateCategory = useChatStore((s) => s.updateCategory);
   const deleteCategory = useChatStore((s) => s.deleteCategory);
+  const updateServer = useChatStore((s) => s.updateServer);
+  const createChannel = useChatStore((s) => s.createChannel);
+  const deleteChannel = useChatStore((s) => s.deleteChannel);
+  const loadServerEmoji = useChatStore((s) => s.loadServerEmoji);
+  const createEmoji = useChatStore((s) => s.createEmoji);
+  const deleteEmoji = useChatStore((s) => s.deleteEmoji);
 
-  const [tab, setTab] = useState<Tab>('roles');
+  const [tab, setTab] = useState<Tab>('overview');
 
-  const serverName = servers.find((s) => s.id === activeServer)?.name ?? 'Server';
+  const server = servers.find((s) => s.id === activeServer);
+  const serverName = server?.name ?? 'Server';
+
+  // Load emoji when switching to emoji tab
+  useEffect(() => {
+    if (tab === 'emoji' && activeServer) {
+      loadServerEmoji(activeServer);
+    }
+  }, [tab, activeServer, loadServerEmoji]);
 
   if (!activeServer) return null;
+
+  const tabs: { key: Tab; label: string }[] = [
+    { key: 'overview', label: 'Overview' },
+    { key: 'channels', label: 'Channels' },
+    { key: 'roles', label: 'Roles' },
+    { key: 'categories', label: 'Categories' },
+    { key: 'emoji', label: 'Emoji' },
+  ];
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
@@ -45,24 +72,31 @@ export function ServerSettings() {
 
         {/* Tab bar */}
         <div className="mb-6 flex gap-1 rounded-lg bg-bg-primary p-1">
-          <button
-            onClick={() => setTab('roles')}
-            className={`flex-1 rounded-md px-4 py-2 text-sm font-medium transition-colors ${
-              tab === 'roles' ? 'bg-bg-accent text-white' : 'text-text-muted hover:text-text-primary'
-            }`}
-          >
-            Roles
-          </button>
-          <button
-            onClick={() => setTab('categories')}
-            className={`flex-1 rounded-md px-4 py-2 text-sm font-medium transition-colors ${
-              tab === 'categories' ? 'bg-bg-accent text-white' : 'text-text-muted hover:text-text-primary'
-            }`}
-          >
-            Categories
-          </button>
+          {tabs.map((t) => (
+            <button
+              key={t.key}
+              onClick={() => setTab(t.key)}
+              className={`flex-1 rounded-md px-3 py-2 text-sm font-medium transition-colors ${
+                tab === t.key ? 'bg-bg-accent text-white' : 'text-text-muted hover:text-text-primary'
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
         </div>
 
+        {tab === 'overview' && (
+          <OverviewTab serverId={activeServer} server={server!} updateServer={updateServer} />
+        )}
+        {tab === 'channels' && (
+          <ChannelsTab
+            serverId={activeServer}
+            channels={channels}
+            categories={categories}
+            createChannel={createChannel}
+            deleteChannel={deleteChannel}
+          />
+        )}
         {tab === 'roles' && (
           <RolesTab
             serverId={activeServer}
@@ -81,10 +115,198 @@ export function ServerSettings() {
             deleteCategory={deleteCategory}
           />
         )}
+        {tab === 'emoji' && (
+          <EmojiTab
+            serverId={activeServer}
+            emoji={customEmoji}
+            createEmoji={createEmoji}
+            deleteEmoji={deleteEmoji}
+          />
+        )}
       </div>
     </div>
   );
 }
+
+// ── Overview Tab ──────────────────────────────────────────
+
+function OverviewTab({
+  serverId,
+  server,
+  updateServer,
+}: {
+  serverId: string;
+  server: { name: string; icon_url?: string | null };
+  updateServer: (serverId: string, name?: string, iconUrl?: string) => void;
+}) {
+  const [name, setName] = useState(server.name);
+  const [iconUrl, setIconUrl] = useState(server.icon_url ?? '');
+  const [saved, setSaved] = useState(false);
+
+  const handleSave = () => {
+    updateServer(serverId, name.trim() || undefined, iconUrl.trim() || undefined);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  };
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <label className="mb-1 block text-sm font-medium text-text-secondary">Server Name</label>
+        <input
+          type="text"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          className="w-full rounded bg-bg-input px-3 py-2 text-sm text-text-primary outline-none"
+          placeholder="Server name"
+        />
+      </div>
+      <div>
+        <label className="mb-1 block text-sm font-medium text-text-secondary">Icon URL</label>
+        <input
+          type="text"
+          value={iconUrl}
+          onChange={(e) => setIconUrl(e.target.value)}
+          className="w-full rounded bg-bg-input px-3 py-2 text-sm text-text-primary placeholder-text-muted outline-none"
+          placeholder="https://example.com/icon.png"
+        />
+        {iconUrl && (
+          <div className="mt-2 flex items-center gap-3">
+            <img
+              src={iconUrl}
+              alt="Server icon preview"
+              className="h-12 w-12 rounded-full object-cover"
+              onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+            />
+            <span className="text-xs text-text-muted">Preview</span>
+          </div>
+        )}
+      </div>
+      <div className="flex items-center gap-3">
+        <button
+          onClick={handleSave}
+          className="rounded bg-bg-accent px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-bg-accent-hover"
+        >
+          Save Changes
+        </button>
+        {saved && <span className="text-sm text-green-400">Saved!</span>}
+      </div>
+    </div>
+  );
+}
+
+// ── Channels Tab ─────────────────────────────────────────
+
+function ChannelsTab({
+  serverId,
+  channels,
+  categories,
+  createChannel,
+  deleteChannel,
+}: {
+  serverId: string;
+  channels: ChannelInfo[];
+  categories: CategoryInfo[];
+  createChannel: (serverId: string, name: string, categoryId?: string, isPrivate?: boolean) => void;
+  deleteChannel: (serverId: string, channel: string) => void;
+}) {
+  const [newName, setNewName] = useState('');
+  const [newCategoryId, setNewCategoryId] = useState('');
+  const [newPrivate, setNewPrivate] = useState(false);
+
+  const sorted = [...channels].sort((a, b) => a.position - b.position);
+  const sortedCategories = [...categories].sort((a, b) => a.position - b.position);
+
+  const handleCreate = () => {
+    if (!newName.trim()) return;
+    createChannel(serverId, newName.trim(), newCategoryId || undefined, newPrivate || undefined);
+    setNewName('');
+    setNewPrivate(false);
+  };
+
+  const getCategoryName = (id?: string | null) => {
+    if (!id) return 'Uncategorized';
+    return categories.find((c) => c.id === id)?.name ?? 'Unknown';
+  };
+
+  return (
+    <div>
+      {/* Create channel */}
+      <div className="mb-4 space-y-2 rounded-md bg-bg-tertiary p-3">
+        <div className="flex gap-2">
+          <input
+            type="text"
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            placeholder="New channel name"
+            className="flex-1 rounded bg-bg-input px-3 py-2 text-sm text-text-primary placeholder-text-muted outline-none"
+            onKeyDown={(e) => e.key === 'Enter' && handleCreate()}
+          />
+          <button
+            onClick={handleCreate}
+            disabled={!newName.trim()}
+            className="rounded bg-bg-accent px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-bg-accent-hover disabled:opacity-50"
+          >
+            Create
+          </button>
+        </div>
+        <div className="flex items-center gap-4">
+          <select
+            value={newCategoryId}
+            onChange={(e) => setNewCategoryId(e.target.value)}
+            className="rounded bg-bg-input px-2 py-1 text-sm text-text-primary outline-none"
+          >
+            <option value="">No Category</option>
+            {sortedCategories.map((cat) => (
+              <option key={cat.id} value={cat.id}>{cat.name}</option>
+            ))}
+          </select>
+          <label className="flex items-center gap-1.5 text-sm text-text-secondary">
+            <input
+              type="checkbox"
+              checked={newPrivate}
+              onChange={(e) => setNewPrivate(e.target.checked)}
+              className="rounded"
+            />
+            Private
+          </label>
+        </div>
+      </div>
+
+      {/* Channel list */}
+      <div className="space-y-1">
+        {sorted.map((ch) => (
+          <div key={ch.id} className="flex items-center justify-between rounded-md bg-bg-tertiary px-3 py-2">
+            <div className="flex items-center gap-2">
+              {ch.is_private ? (
+                <svg className="h-4 w-4 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                </svg>
+              ) : (
+                <span className="text-text-muted">#</span>
+              )}
+              <span className="text-sm font-medium text-text-primary">{ch.name.replace(/^#/, '')}</span>
+              <span className="text-xs text-text-muted">{getCategoryName(ch.category_id)}</span>
+              {ch.is_nsfw && <span className="rounded bg-red-500/20 px-1 text-xs text-red-400">NSFW</span>}
+            </div>
+            <button
+              onClick={() => deleteChannel(serverId, ch.name)}
+              className="rounded px-2 py-1 text-xs text-bg-danger hover:bg-bg-danger/10"
+            >
+              Delete
+            </button>
+          </div>
+        ))}
+
+        {sorted.length === 0 && (
+          <p className="py-4 text-center text-sm text-text-muted">No channels yet.</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Roles Tab ────────────────────────────────────────────
 
 function RolesTab({
   serverId,
@@ -257,6 +479,8 @@ function RolesTab({
   );
 }
 
+// ── Categories Tab ───────────────────────────────────────
+
 function CategoriesTab({
   serverId,
   categories,
@@ -367,6 +591,110 @@ function CategoriesTab({
 
         {sorted.length === 0 && (
           <p className="py-4 text-center text-sm text-text-muted">No categories yet. Create one to organize your channels.</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Emoji Tab ────────────────────────────────────────────
+
+function EmojiTab({
+  serverId,
+  emoji,
+  createEmoji,
+  deleteEmoji,
+}: {
+  serverId: string;
+  emoji: Record<string, string>;
+  createEmoji: (serverId: string, name: string, imageUrl: string) => Promise<void>;
+  deleteEmoji: (serverId: string, emojiId: string) => Promise<void>;
+}) {
+  const [newName, setNewName] = useState('');
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const emojiEntries = Object.entries(emoji);
+
+  const handleUpload = async () => {
+    const file = fileInputRef.current?.files?.[0];
+    if (!file || !newName.trim()) return;
+
+    // Validate: images only, max 256KB
+    if (!file.type.startsWith('image/')) {
+      setError('Only image files are allowed');
+      return;
+    }
+    if (file.size > 256 * 1024) {
+      setError('Emoji must be under 256KB');
+      return;
+    }
+
+    setUploading(true);
+    setError('');
+    try {
+      const attachment = await uploadFile(file);
+      await createEmoji(serverId, newName.trim(), attachment.url);
+      setNewName('');
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Upload failed');
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  return (
+    <div>
+      {/* Upload form */}
+      <div className="mb-4 space-y-2 rounded-md bg-bg-tertiary p-3">
+        <div className="flex gap-2">
+          <input
+            type="text"
+            value={newName}
+            onChange={(e) => setNewName(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ''))}
+            placeholder="emoji_name"
+            className="flex-1 rounded bg-bg-input px-3 py-2 text-sm text-text-primary placeholder-text-muted outline-none"
+            maxLength={32}
+          />
+          <button
+            onClick={handleUpload}
+            disabled={uploading || !newName.trim() || !fileInputRef.current?.files?.length}
+            className="rounded bg-bg-accent px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-bg-accent-hover disabled:opacity-50"
+          >
+            {uploading ? 'Uploading...' : 'Upload'}
+          </button>
+        </div>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          className="text-sm text-text-secondary file:mr-3 file:rounded file:border-0 file:bg-bg-accent file:px-3 file:py-1 file:text-sm file:text-white"
+        />
+        {newName && <p className="text-xs text-text-muted">Will be used as <code className="rounded bg-bg-primary px-1">:{newName}:</code></p>}
+        {error && <p className="text-xs text-red-400">{error}</p>}
+      </div>
+
+      {/* Emoji list */}
+      <div className="space-y-1">
+        {emojiEntries.map(([name, url]) => (
+          <div key={name} className="flex items-center justify-between rounded-md bg-bg-tertiary px-3 py-2">
+            <div className="flex items-center gap-3">
+              <img src={url} alt={name} className="h-8 w-8 object-contain" />
+              <span className="text-sm text-text-primary">:{name}:</span>
+            </div>
+            <button
+              onClick={() => deleteEmoji(serverId, name)}
+              className="rounded px-2 py-1 text-xs text-bg-danger hover:bg-bg-danger/10"
+            >
+              Delete
+            </button>
+          </div>
+        ))}
+
+        {emojiEntries.length === 0 && (
+          <p className="py-4 text-center text-sm text-text-muted">No custom emoji yet. Upload one above!</p>
         )}
       </div>
     </div>

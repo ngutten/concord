@@ -1,8 +1,10 @@
 import { useState, useRef, useEffect } from 'react';
+import { useChatStore } from '../../stores/chatStore';
 
 interface EmojiPickerProps {
   onSelect: (emoji: string) => void;
   onClose: () => void;
+  serverId?: string | null;
 }
 
 const EMOJI_CATEGORIES: { name: string; emojis: string[] }[] = [
@@ -70,8 +72,15 @@ const EMOJI_CATEGORIES: { name: string; emojis: string[] }[] = [
   },
 ];
 
-export function EmojiPicker({ onSelect, onClose }: EmojiPickerProps) {
-  const [activeCategory, setActiveCategory] = useState(0);
+const EMPTY_EMOJI: Record<string, string> = {};
+
+export function EmojiPicker({ onSelect, onClose, serverId }: EmojiPickerProps) {
+  const customEmoji = useChatStore((s) => (serverId ? s.customEmoji[serverId] ?? EMPTY_EMOJI : EMPTY_EMOJI));
+  const customEntries = Object.entries(customEmoji);
+  const hasCustom = customEntries.length > 0;
+
+  // -1 = server tab, 0+ = unicode categories
+  const [activeCategory, setActiveCategory] = useState(hasCustom ? -1 : 0);
   const [search, setSearch] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
   const pickerRef = useRef<HTMLDivElement>(null);
@@ -91,10 +100,19 @@ export function EmojiPicker({ onSelect, onClose }: EmojiPickerProps) {
     return () => document.removeEventListener('mousedown', handleClick);
   }, [onClose]);
 
-  const allEmojis = EMOJI_CATEGORIES.flatMap((c) => c.emojis);
-  const filtered = search
-    ? allEmojis.filter(() => true) // Can't search by name without a mapping, just show all when searching
-    : EMOJI_CATEGORIES[activeCategory].emojis;
+  const searchLower = search.toLowerCase();
+
+  // Filter custom emoji by search
+  const filteredCustom = search
+    ? customEntries.filter(([name]) => name.toLowerCase().includes(searchLower))
+    : customEntries;
+
+  const allUnicode = EMOJI_CATEGORIES.flatMap((c) => c.emojis);
+  const filteredUnicode = search
+    ? allUnicode // Show all unicode when searching (no name metadata to filter)
+    : activeCategory >= 0
+      ? EMOJI_CATEGORIES[activeCategory].emojis
+      : [];
 
   return (
     <div
@@ -119,6 +137,21 @@ export function EmojiPicker({ onSelect, onClose }: EmojiPickerProps) {
       {/* Category tabs */}
       {!search && (
         <div className="flex border-b border-border px-1">
+          {hasCustom && (
+            <button
+              onClick={() => setActiveCategory(-1)}
+              className={`px-2 py-1.5 text-center text-xs transition-colors ${
+                activeCategory === -1
+                  ? 'border-b-2 border-blue-400 text-text-primary'
+                  : 'text-text-muted hover:text-text-secondary'
+              }`}
+              title="Server Emoji"
+            >
+              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M5 12h14M12 5l7 7-7 7" />
+              </svg>
+            </button>
+          )}
           {EMOJI_CATEGORIES.map((cat, i) => (
             <button
               key={cat.name}
@@ -138,21 +171,54 @@ export function EmojiPicker({ onSelect, onClose }: EmojiPickerProps) {
 
       {/* Emoji grid */}
       <div className="h-52 overflow-y-auto p-2">
-        <div className="grid grid-cols-8 gap-0.5">
-          {filtered.map((emoji, i) => (
-            <button
-              key={`${emoji}-${i}`}
-              onClick={() => {
-                onSelect(emoji);
-                onClose();
-              }}
-              className="flex h-8 w-8 items-center justify-center rounded text-xl transition-colors hover:bg-bg-hover"
-              title={emoji}
-            >
-              {emoji}
-            </button>
-          ))}
-        </div>
+        {/* Custom emoji section */}
+        {(activeCategory === -1 || search) && filteredCustom.length > 0 && (
+          <>
+            {search && <p className="mb-1 text-xs font-semibold text-text-muted">Server Emoji</p>}
+            <div className="grid grid-cols-8 gap-0.5">
+              {filteredCustom.map(([name, url]) => (
+                <button
+                  key={name}
+                  onClick={() => {
+                    onSelect(`:${name}:`);
+                    onClose();
+                  }}
+                  className="flex h-8 w-8 items-center justify-center rounded transition-colors hover:bg-bg-hover"
+                  title={`:${name}:`}
+                >
+                  <img src={url} alt={name} className="h-6 w-6 object-contain" />
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+
+        {/* Unicode emoji section */}
+        {(activeCategory >= 0 || search) && (
+          <>
+            {search && filteredCustom.length > 0 && <p className="mb-1 mt-2 text-xs font-semibold text-text-muted">Unicode</p>}
+            <div className="grid grid-cols-8 gap-0.5">
+              {filteredUnicode.map((emoji, i) => (
+                <button
+                  key={`${emoji}-${i}`}
+                  onClick={() => {
+                    onSelect(emoji);
+                    onClose();
+                  }}
+                  className="flex h-8 w-8 items-center justify-center rounded text-xl transition-colors hover:bg-bg-hover"
+                  title={emoji}
+                >
+                  {emoji}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+
+        {/* Empty state for custom */}
+        {activeCategory === -1 && !search && filteredCustom.length === 0 && (
+          <p className="py-8 text-center text-sm text-text-muted">No custom emoji for this server</p>
+        )}
       </div>
     </div>
   );

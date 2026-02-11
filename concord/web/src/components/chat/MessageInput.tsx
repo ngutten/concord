@@ -310,7 +310,7 @@ export function MessageInput() {
         </button>
         {/* Emoji picker */}
         {showEmojiPicker && (
-          <EmojiPicker onSelect={handleEmojiSelect} onClose={() => setShowEmojiPicker(false)} />
+          <EmojiPicker onSelect={handleEmojiSelect} onClose={() => setShowEmojiPicker(false)} serverId={activeServer} />
         )}
         <input
           ref={inputRef}

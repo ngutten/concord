@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import type { AttachmentInfo, AuditLogEntry, AutomodRuleInfo, BanInfo, BookmarkInfo, BotTokenInfo, CategoryInfo, ChannelInfo, ChannelPositionInfo, EventInfo, ForumTagInfo, HistoryMessage, InviteInfo, MemberInfo, OAuth2AppInfo, PinnedMessageInfo, PresenceInfo, ReplyInfo, RoleInfo, SearchResultMessage, ServerCommunityInfo, ServerEvent, ServerInfo, SlashCommandInfo, TemplateInfo, ThreadInfo, UserProfileInfo, WebhookInfo } from '../api/types';
-import { listServerEmoji } from '../api/client';
+import { listServerEmoji, createServerEmoji, deleteServerEmoji } from '../api/client';
 import { channelKey } from '../api/types';
 import { WebSocketManager } from '../api/websocket';
 
@@ -123,7 +123,10 @@ interface ChatState {
   createChannel: (serverId: string, name: string, categoryId?: string, isPrivate?: boolean) => void;
   deleteChannel: (serverId: string, channel: string) => void;
   deleteServer: (serverId: string) => void;
+  updateServer: (serverId: string, name?: string, iconUrl?: string) => void;
   loadServerEmoji: (serverId: string) => void;
+  createEmoji: (serverId: string, name: string, imageUrl: string) => Promise<void>;
+  deleteEmoji: (serverId: string, emojiId: string) => Promise<void>;
   listRoles: (serverId: string) => void;
   createRole: (serverId: string, name: string, color?: string, permissions?: number) => void;
   updateRole: (serverId: string, roleId: string, updates: { name?: string; color?: string; permissions?: number; position?: number }) => void;
@@ -1196,6 +1199,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     get().ws?.send({ type: 'delete_server', server_id: serverId });
   },
 
+  updateServer: (serverId, name, iconUrl) => {
+    get().ws?.send({ type: 'update_server', server_id: serverId, name, icon_url: iconUrl });
+  },
+
   loadServerEmoji: (serverId) => {
     listServerEmoji(serverId)
       .then((emojis) => {
@@ -1210,6 +1217,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
       .catch((err) => {
         console.error('Failed to load emoji for server', serverId, err);
       });
+  },
+
+  createEmoji: async (serverId, name, imageUrl) => {
+    await createServerEmoji(serverId, name, imageUrl);
+    get().loadServerEmoji(serverId);
+  },
+
+  deleteEmoji: async (serverId, emojiId) => {
+    await deleteServerEmoji(serverId, emojiId);
+    get().loadServerEmoji(serverId);
   },
 
   listRoles: (serverId) => {

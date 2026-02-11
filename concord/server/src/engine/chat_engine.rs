@@ -436,6 +436,43 @@ impl ChatEngine {
         Ok(())
     }
 
+    /// Update a server's name and/or icon.
+    pub async fn update_server_settings(
+        &self,
+        server_id: &str,
+        name: Option<&str>,
+        icon_url: Option<&str>,
+    ) -> Result<(), String> {
+        let mut server = self
+            .servers
+            .get_mut(server_id)
+            .ok_or_else(|| format!("No such server: {server_id}"))?;
+
+        let new_name = name.unwrap_or(&server.name).to_string();
+        let new_icon = if icon_url.is_some() {
+            icon_url.map(|s| s.to_string())
+        } else {
+            server.icon_url.clone()
+        };
+
+        if let Some(pool) = &self.db {
+            crate::db::queries::servers::update_server(
+                pool,
+                server_id,
+                &new_name,
+                new_icon.as_deref(),
+            )
+            .await
+            .map_err(|e| format!("Failed to update server: {e}"))?;
+        }
+
+        server.name = new_name;
+        server.icon_url = new_icon;
+
+        info!(%server_id, "server settings updated");
+        Ok(())
+    }
+
     /// List servers for a user (by their DB user_id).
     pub fn list_servers_for_user(&self, user_id: &str) -> Vec<ServerInfo> {
         self.servers
@@ -547,6 +584,8 @@ impl ChatEngine {
         &self,
         server_id: &str,
         name: &str,
+        category_id: Option<&str>,
+        is_private: bool,
     ) -> Result<String, String> {
         let name = normalize_channel_name(name);
         validation::validate_channel_name(&name)?;
@@ -568,9 +607,23 @@ impl ChatEngine {
             crate::db::queries::channels::ensure_channel(pool, &channel_id, server_id, &name)
                 .await
                 .map_err(|e| format!("Failed to create channel: {e}"))?;
+
+            if let Some(cat_id) = category_id {
+                crate::db::queries::channels::update_channel_category(pool, &channel_id, Some(cat_id))
+                    .await
+                    .map_err(|e| format!("Failed to set channel category: {e}"))?;
+            }
+
+            if is_private {
+                crate::db::queries::channels::set_channel_private(pool, &channel_id, true)
+                    .await
+                    .map_err(|e| format!("Failed to set channel private: {e}"))?;
+            }
         }
 
-        let ch = ChannelState::new(channel_id.clone(), server_id.to_string(), name.clone());
+        let mut ch = ChannelState::new(channel_id.clone(), server_id.to_string(), name.clone());
+        ch.category_id = category_id.map(|s| s.to_string());
+        ch.is_private = is_private;
         self.channel_name_index
             .insert((server_id.to_string(), name), channel_id.clone());
         if let Some(mut srv) = self.servers.get_mut(server_id) {

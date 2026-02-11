@@ -63,17 +63,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/auth/status",
             axum::routing::get(rest_api::auth_status),
         )
-        // OAuth flows
-        .route("/api/auth/github", axum::routing::get(oauth::github_login))
-        .route(
-            "/api/auth/github/callback",
-            axum::routing::get(oauth::github_callback),
-        )
-        .route("/api/auth/google", axum::routing::get(oauth::google_login))
-        .route(
-            "/api/auth/google/callback",
-            axum::routing::get(oauth::google_callback),
-        )
         // Bluesky / AT Protocol OAuth
         .route(
             "/api/auth/atproto/client-metadata.json",

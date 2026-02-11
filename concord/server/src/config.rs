@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::path::Path;
 use tracing::info;
 
-use crate::auth::config::{AuthConfig, OAuthProviderConfig};
+use crate::auth::config::AuthConfig;
 
 /// Top-level server configuration, loaded from concord.toml.
 #[derive(Deserialize, Default)]
@@ -11,7 +11,6 @@ pub struct ServerConfig {
     pub server: ServerSection,
     pub database: DatabaseSection,
     pub auth: AuthSection,
-    pub oauth: OAuthSection,
     pub storage: StorageSection,
     pub admin: AdminSection,
 }
@@ -71,30 +70,15 @@ impl Default for AuthSection {
     }
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-pub struct OAuthSection {
-    pub github: Option<OAuthProviderSection>,
-    pub google: Option<OAuthProviderSection>,
-}
-
-#[derive(Deserialize, Clone)]
-pub struct OAuthProviderSection {
-    pub client_id: String,
-    pub client_secret: String,
-}
-
 #[derive(Deserialize)]
 #[serde(default)]
 pub struct StorageSection {
-    pub upload_dir: String,
     pub max_file_size_mb: u64,
 }
 
 impl Default for StorageSection {
     fn default() -> Self {
         Self {
-            upload_dir: "uploads".into(),
             max_file_size_mb: 100,
         }
     }
@@ -114,7 +98,6 @@ impl ServerConfig {
             Self::default()
         };
 
-        // Environment variables override TOML values
         config.apply_env_overrides();
         config
     }
@@ -140,39 +123,11 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("PUBLIC_URL") {
             self.auth.public_url = v;
         }
-        // OAuth env overrides
-        if let (Ok(id), Ok(secret)) = (
-            std::env::var("GITHUB_CLIENT_ID"),
-            std::env::var("GITHUB_CLIENT_SECRET"),
-        ) && !id.is_empty()
-            && !secret.is_empty()
-        {
-            self.oauth.github = Some(OAuthProviderSection {
-                client_id: id,
-                client_secret: secret,
-            });
-        }
-        if let (Ok(id), Ok(secret)) = (
-            std::env::var("GOOGLE_CLIENT_ID"),
-            std::env::var("GOOGLE_CLIENT_SECRET"),
-        ) && !id.is_empty()
-            && !secret.is_empty()
-        {
-            self.oauth.google = Some(OAuthProviderSection {
-                client_id: id,
-                client_secret: secret,
-            });
-        }
-        // Storage env overrides
-        if let Ok(v) = std::env::var("UPLOAD_DIR") {
-            self.storage.upload_dir = v;
-        }
         if let Ok(v) = std::env::var("MAX_FILE_SIZE_MB")
             && let Ok(mb) = v.parse()
         {
             self.storage.max_file_size_mb = mb;
         }
-        // Admin env overrides
         if let Ok(v) = std::env::var("ADMIN_USERS") {
             self.admin.admin_users = v
                 .split(',')
@@ -188,14 +143,6 @@ impl ServerConfig {
             jwt_secret: self.auth.jwt_secret.clone(),
             session_expiry_hours: self.auth.session_expiry_hours,
             public_url: self.auth.public_url.clone(),
-            github: self.oauth.github.as_ref().map(|p| OAuthProviderConfig {
-                client_id: p.client_id.clone(),
-                client_secret: p.client_secret.clone(),
-            }),
-            google: self.oauth.google.as_ref().map(|p| OAuthProviderConfig {
-                client_id: p.client_id.clone(),
-                client_secret: p.client_secret.clone(),
-            }),
         }
     }
 }

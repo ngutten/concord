@@ -16,6 +16,8 @@ pub struct BlobRef {
     pub cid: String,
     /// URL to download the blob from the PDS.
     pub url: String,
+    /// MIME type as stored by the PDS (may differ from what was uploaded).
+    pub mime_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -31,6 +33,8 @@ struct BlobData {
     ref_link: Option<RefLink>,
     #[serde(rename = "cid")]
     cid_str: Option<String>,
+    #[serde(rename = "mimeType")]
+    mime_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -106,6 +110,9 @@ pub async fn upload_blob_to_pds(
 
     // Pin the blob by creating a record that references it in the user's repo.
     // Without this, the PDS will not serve the blob via com.atproto.sync.getBlob.
+    // Use the PDS-stored MIME type (not the client-provided one) to avoid mismatch errors.
+    // The PDS may normalize MIME types (e.g. "audio/webm;codecs=opus" → "video/webm").
+    let pin_mime_type = blob_ref.mime_type.as_deref().unwrap_or(content_type);
     let file_size = file_bytes.len();
     if let Err(e) = pin_blob_with_record(
         &dpop_key,
@@ -113,7 +120,7 @@ pub async fn upload_blob_to_pds(
         pds_url,
         &creds.did,
         &blob_ref.cid,
-        content_type,
+        pin_mime_type,
         file_size,
     )
     .await
@@ -241,7 +248,11 @@ fn finalize_blob_ref(resp: &UploadBlobResponse, pds_url: &str, did: &str) -> Blo
         urlencoding::encode(&cid)
     );
 
-    BlobRef { cid, url }
+    BlobRef {
+        cid,
+        url,
+        mime_type: resp.blob.mime_type.clone(),
+    }
 }
 
 /// JSON body for com.atproto.repo.createRecord

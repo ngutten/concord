@@ -626,7 +626,8 @@ export type ClientCommand =
   | { type: 'respond_to_interaction'; interaction_id: string; content?: string; embeds_json?: string; components_json?: string }
   | { type: 'create_oauth2_app'; name: string; description: string; redirect_uris: string; scopes?: string }
   | { type: 'list_oauth2_apps' }
-  | { type: 'delete_oauth2_app'; app_id: string };
+  | { type: 'delete_oauth2_app'; app_id: string }
+  | { type: 'update_server'; server_id: string; name?: string; icon_url?: string };
 
 // ── Helpers ─────────────────────────────────────────────
 

@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added — Server Management & Emoji UX (#148)
+- Channel creation UI with "+" button on each category header
+- Inline channel creation form with name, category, and private toggle
+- Permission checks (MANAGE_CHANNELS) on channel create/delete
+- ServerSettings expanded to 5 tabs: Overview, Channels, Roles, Categories, Emoji
+- Server overview editing (rename, change icon URL) with UpdateServer WS command
+- Emoji management panel (upload, list, delete) in server settings
+- Custom server emoji tab in EmojiPicker with search support
+- Emoji upload flow: file picker → PDS blob upload → create emoji
+
+### Changed — AT Protocol Only (#149)
+- Removed GitHub and Google OAuth providers — Bluesky login only
+- Removed local disk storage fallback — all uploads require PDS blob storage
+- Removed `oauth2` crate dependency
+- Simplified login page to Bluesky handle input only
+- Simplified auth config (no more provider sections)
+- Upload endpoint returns 503 if PDS credentials are missing/expired
+
 ### Added — Phase 8: Integrations & Bots (#56)
 - Webhook system (incoming POST endpoint + outgoing event subscriptions)
 - Bot accounts with hashed API tokens and `Authorization: Bot <token>` auth
@@ -102,7 +120,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Admin bootstrap via config (#140)
 - Multi-server architecture with server-aware ChatEngine
 - React 19 + TypeScript + Vite + Tailwind 4 frontend
-- OAuth authentication (GitHub, Google, Bluesky/AT Protocol)
+- AT Protocol (Bluesky) OAuth authentication with PDS blob storage
 - IRC protocol support (RFC 2812 parser, TCP listener, command dispatch)
 - SQLite persistence with WAL mode
 - Chat engine with protocol-agnostic event system

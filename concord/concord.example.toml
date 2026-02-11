@@ -15,10 +15,8 @@ jwt_secret = "change-me-to-a-random-secret"
 session_expiry_hours = 720  # 30 days
 public_url = "http://localhost:8080"
 
-[oauth.github]
-client_id = ""
-client_secret = ""
+[storage]
+max_file_size_mb = 100
 
-[oauth.google]
-client_id = ""
-client_secret = ""
+[admin]
+admin_users = []

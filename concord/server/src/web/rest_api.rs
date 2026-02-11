@@ -7,7 +7,6 @@ use axum::http::StatusCode;
 use axum::http::header;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
-use tokio_util::io::ReaderStream;
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -347,18 +346,10 @@ pub struct AuthStatusResponse {
 }
 
 /// GET /api/auth/status — returns available providers and auth state.
-pub async fn auth_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let mut providers = vec!["atproto".to_string()];
-    if state.auth_config.github.is_some() {
-        providers.push("github".to_string());
-    }
-    if state.auth_config.google.is_some() {
-        providers.push("google".to_string());
-    }
-
+pub async fn auth_status() -> impl IntoResponse {
     Json(AuthStatusResponse {
         authenticated: false, // caller can check /api/me instead
-        providers,
+        providers: vec!["atproto".to_string()],
     })
 }
 
@@ -629,7 +620,7 @@ pub async fn upload_file(
             }
 
             let url = format!("/api/uploads/{}", attachment_id);
-            return (
+            (
                 StatusCode::CREATED,
                 Json(UploadResponse {
                     id: attachment_id,
@@ -639,51 +630,17 @@ pub async fn upload_file(
                     url,
                 }),
             )
-                .into_response();
+                .into_response()
         }
         Err(e) => {
-            // No AT Protocol credentials or PDS upload failed — fall back to local storage
-            info!(error = %e, "PDS blob upload unavailable, using local storage");
+            error!(error = %e, "PDS blob upload failed — AT Protocol credentials may be missing or expired");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "File upload requires AT Protocol (Bluesky) authentication with valid PDS credentials",
+            )
+                .into_response()
         }
     }
-
-    // Fallback: store on disk as {upload_dir}/{id}
-    let file_path = state.upload_dir.join(&attachment_id);
-    if let Err(e) = tokio::fs::write(&file_path, &bytes).await {
-        error!(error = %e, "Failed to write upload to disk");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to store file").into_response();
-    }
-
-    // Insert DB record (local storage, no blob fields)
-    if let Err(e) = attachments::insert_attachment(
-        &state.db,
-        &attachment_id,
-        &auth.user_id,
-        &attachment_id, // storage filename = id
-        safe_filename,
-        &content_type,
-        file_size,
-    )
-    .await
-    {
-        error!(error = %e, "Failed to insert attachment record");
-        let _ = tokio::fs::remove_file(&file_path).await;
-        return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
-    }
-
-    let url = format!("/api/uploads/{}", attachment_id);
-
-    (
-        StatusCode::CREATED,
-        Json(UploadResponse {
-            id: attachment_id,
-            filename: safe_filename.to_string(),
-            content_type,
-            file_size,
-            url,
-        }),
-    )
-        .into_response()
 }
 
 /// GET /api/uploads/:id — serve an uploaded file.
@@ -701,39 +658,48 @@ pub async fn get_upload(
         }
     };
 
-    // If the attachment has a PDS blob URL, redirect to it
-    if let Some(blob_url) = &attachment.blob_url {
-        info!(attachment_id = %attachment_id, blob_url = %blob_url, "Redirecting to PDS blob");
-        return axum::response::Redirect::temporary(blob_url).into_response();
-    }
-
-    // Otherwise serve from local disk
-    let file_path = state.upload_dir.join(&attachment_id);
-    let file = match tokio::fs::File::open(&file_path).await {
-        Ok(f) => f,
-        Err(_) => return (StatusCode::NOT_FOUND, "File not found on disk").into_response(),
+    // Proxy blob from user's PDS through our server.
+    // This avoids CORS issues (PDS doesn't send CORS headers) and ensures
+    // the correct Content-Type is served for audio/video playback.
+    let Some(blob_url) = &attachment.blob_url else {
+        return (StatusCode::NOT_FOUND, "Attachment has no PDS blob URL").into_response();
     };
 
-    let stream = ReaderStream::new(file);
-    let body = Body::from_stream(stream);
-
-    let content_disposition = format!(
-        "inline; filename=\"{}\"",
-        attachment.original_filename.replace('"', "\\\"")
-    );
-
-    (
-        [
-            (header::CONTENT_TYPE, attachment.content_type),
-            (header::CONTENT_DISPOSITION, content_disposition),
+    info!(attachment_id = %attachment_id, blob_url = %blob_url, "Proxying PDS blob");
+    let client = reqwest::Client::new();
+    match client.get(blob_url.as_str()).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let content_disposition = format!(
+                "inline; filename=\"{}\"",
+                attachment.original_filename.replace('"', "\\\"")
+            );
+            let body = Body::from_stream(resp.bytes_stream());
             (
-                header::CACHE_CONTROL,
-                "public, max-age=31536000, immutable".to_string(),
-            ),
-        ],
-        body,
-    )
-        .into_response()
+                [
+                    (header::CONTENT_TYPE, attachment.content_type),
+                    (header::CONTENT_DISPOSITION, content_disposition),
+                    (
+                        header::CACHE_CONTROL,
+                        "public, max-age=31536000, immutable".to_string(),
+                    ),
+                ],
+                body,
+            )
+                .into_response()
+        }
+        Ok(resp) => {
+            error!(
+                attachment_id = %attachment_id,
+                status = %resp.status(),
+                "PDS blob fetch returned error"
+            );
+            (StatusCode::BAD_GATEWAY, "Failed to fetch blob from storage").into_response()
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to proxy PDS blob");
+            (StatusCode::BAD_GATEWAY, "Failed to fetch blob from storage").into_response()
+        }
+    }
 }
 
 // ── Custom emoji endpoints ──────────────────────────────────────
@@ -1210,24 +1176,13 @@ mod tests {
     fn test_auth_status_response_serialize() {
         let resp = AuthStatusResponse {
             authenticated: false,
-            providers: vec!["atproto".into(), "github".into()],
+            providers: vec!["atproto".into()],
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["authenticated"], false);
         let providers = json["providers"].as_array().unwrap();
-        assert_eq!(providers.len(), 2);
+        assert_eq!(providers.len(), 1);
         assert_eq!(providers[0], "atproto");
-        assert_eq!(providers[1], "github");
-    }
-
-    #[test]
-    fn test_auth_status_response_single_provider() {
-        let resp = AuthStatusResponse {
-            authenticated: false,
-            providers: vec!["atproto".into()],
-        };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["providers"].as_array().unwrap().len(), 1);
     }
 
     // ── UserProfile serialization ──

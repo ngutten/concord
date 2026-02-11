@@ -12,6 +12,7 @@ use crate::auth::token::validate_session_token;
 use crate::db::queries::users;
 use crate::engine::chat_engine::{ChatEngine, DEFAULT_SERVER_ID};
 use crate::engine::events::ChatEvent;
+use crate::engine::permissions::Permissions;
 use crate::engine::user_session::Protocol;
 
 use super::app_state::AppState;
@@ -83,6 +84,8 @@ enum ClientMessage {
     CreateChannel {
         server_id: String,
         name: String,
+        category_id: Option<String>,
+        is_private: Option<bool>,
     },
     DeleteChannel {
         server_id: String,
@@ -90,6 +93,11 @@ enum ClientMessage {
     },
     DeleteServer {
         server_id: String,
+    },
+    UpdateServer {
+        server_id: String,
+        name: Option<String>,
+        icon_url: Option<String>,
     },
     UpdateMemberRole {
         server_id: String,
@@ -795,33 +803,63 @@ async fn handle_client_message(
                 Err(e) => Err(e),
             }
         }
-        ClientMessage::CreateChannel { server_id, name } => {
-            match engine.create_channel_in_server(&server_id, &name).await {
-                Ok(_) => {
-                    let channels = engine.list_channels(&server_id);
-                    if let Some(session) = engine.get_session(session_id) {
-                        let _ = session.send(ChatEvent::ChannelList {
-                            server_id,
-                            channels,
-                        });
+        ClientMessage::CreateChannel { server_id, name, category_id, is_private } => {
+            match engine
+                .require_permission(
+                    session_id,
+                    &server_id,
+                    None,
+                    Permissions::MANAGE_CHANNELS,
+                )
+                .await
+            {
+                Ok(_) => match engine
+                    .create_channel_in_server(
+                        &server_id,
+                        &name,
+                        category_id.as_deref(),
+                        is_private.unwrap_or(false),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        let channels = engine.list_channels(&server_id);
+                        if let Some(session) = engine.get_session(session_id) {
+                            let _ = session.send(ChatEvent::ChannelList {
+                                server_id,
+                                channels,
+                            });
+                        }
+                        Ok(())
                     }
-                    Ok(())
-                }
+                    Err(e) => Err(e),
+                },
                 Err(e) => Err(e),
             }
         }
         ClientMessage::DeleteChannel { server_id, channel } => {
-            match engine.delete_channel_in_server(&server_id, &channel).await {
-                Ok(()) => {
-                    let channels = engine.list_channels(&server_id);
-                    if let Some(session) = engine.get_session(session_id) {
-                        let _ = session.send(ChatEvent::ChannelList {
-                            server_id,
-                            channels,
-                        });
+            match engine
+                .require_permission(
+                    session_id,
+                    &server_id,
+                    None,
+                    Permissions::MANAGE_CHANNELS,
+                )
+                .await
+            {
+                Ok(_) => match engine.delete_channel_in_server(&server_id, &channel).await {
+                    Ok(()) => {
+                        let channels = engine.list_channels(&server_id);
+                        if let Some(session) = engine.get_session(session_id) {
+                            let _ = session.send(ChatEvent::ChannelList {
+                                server_id,
+                                channels,
+                            });
+                        }
+                        Ok(())
                     }
-                    Ok(())
-                }
+                    Err(e) => Err(e),
+                },
                 Err(e) => Err(e),
             }
         }
@@ -853,6 +891,34 @@ async fn handle_client_message(
                         let _ = session.send(ChatEvent::ServerList { servers });
                     }
                     Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        ClientMessage::UpdateServer { server_id, name, icon_url } => {
+            match engine
+                .require_permission(
+                    session_id,
+                    &server_id,
+                    None,
+                    Permissions::MANAGE_SERVER,
+                )
+                .await
+            {
+                Ok(_) => {
+                    match engine.update_server_settings(&server_id, name.as_deref(), icon_url.as_deref()).await {
+                        Ok(()) => {
+                            // Send updated server list to the requester
+                            if let Some(session) = engine.get_session(session_id)
+                                && let Some(ref uid) = session.user_id
+                            {
+                                let servers = engine.list_servers_for_user(uid);
+                                let _ = session.send(ChatEvent::ServerList { servers });
+                            }
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
                 Err(e) => Err(e),
             }
@@ -2142,9 +2208,11 @@ mod tests {
         )
         .unwrap();
         match msg {
-            ClientMessage::CreateChannel { server_id, name } => {
+            ClientMessage::CreateChannel { server_id, name, category_id, is_private } => {
                 assert_eq!(server_id, "srv-1");
                 assert_eq!(name, "new-channel");
+                assert!(category_id.is_none());
+                assert!(is_private.is_none());
             }
             _ => panic!("Expected CreateChannel"),
         }
